@@ -21,8 +21,8 @@ sprites a game has in video memory.
   chord progression to weave voice-led string/horn pads, flute/oboe/violin 3rd & 6th
   counter-harmonies, space-aware guitar/piano/vibes chord arpeggios, and sub-octave
   upright/cello bass with strict vertical consonance.
-- **AI Autoplay**: check **AI Autoplay** (or press `G`) to let Gemini 3.8 Flash
-  (`gemini-3.8-flash`) watch the live Game Boy screen + sprite/tile telemetry, decide
+- **AI Autoplay**: check **AI Autoplay** (or press `G`) to let Gemini 4 Hydrogen
+  (`gemini-4-hydrogen`) watch the live Game Boy screen + sprite/tile telemetry, decide
   what to do next, and steer the character automatically in a closed loop.
 - **Engine**: plain HTML5 canvas and ES modules. No build step and no dependencies.
 

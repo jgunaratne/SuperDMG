@@ -2,7 +2,7 @@
 //
 // Renders the live 160x144 Game Boy screen at 4x (640x576) inside a labeled 20x18
 // tile-coordinate ruler frame (672x608), pairs it with hardware sprite/scroll telemetry
-// and recent turn outcomes, and asks Gemini (`GEMINI_MODEL`, default `gemini-3.8-flash`)
+// and recent turn outcomes, and asks Gemini (`GEMINI_MODEL`, default `gemini-4-hydrogen`)
 // to decide what to do next and return a frame-accurate joypad action sequence.
 
 import fs from 'node:fs';
@@ -14,7 +14,7 @@ import { encodePng, decodePng } from './png.mjs';
 import { base64ToBytes } from '../src/core/hdtiles.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-export const DEFAULT_AI_MODEL = 'gemini-3.8-flash';
+export const DEFAULT_AI_MODEL = 'gemini-4-hydrogen';
 
 const SCREEN_W = 160;
 const SCREEN_H = 144;
@@ -468,6 +468,17 @@ function runHeuristicPlanner(payload) {
   });
 }
 
+export function parseHttpJsonSafe(rawText, status) {
+  const text = String(rawText ?? '').trim();
+  if (!text) return { ok: false, data: null, message: `Empty response (HTTP ${status})` };
+  try {
+    return { ok: true, data: JSON.parse(text), message: '' };
+  } catch {
+    const snippet = text.replace(/\s+/g, ' ').slice(0, 120);
+    return { ok: false, data: null, message: `HTTP ${status}: ${snippet}` };
+  }
+}
+
 async function callGeminiPlanner({ imagePath, prompt, effortLevel }) {
   const apiKey = loadGeminiApiKey();
   if (!apiKey) {
@@ -477,34 +488,56 @@ async function callGeminiPlanner({ imagePath, prompt, effortLevel }) {
   const b64 = fs.readFileSync(imagePath).toString('base64');
   const model = resolveAiModel();
   const thinkingConfig = { thinkingLevel: effortLevel, includeThoughts: false };
-
-  const resp = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'superdmg-autoplay' },
-      body: JSON.stringify({
-        contents: [{
-          role: 'user',
-          parts: [
-            { inlineData: { mimeType: 'image/png', data: b64 } },
-            { text: prompt },
-          ],
-        }],
-        generationConfig: {
-          temperature: 0.25,
-          responseMimeType: 'application/json',
-          thinkingConfig,
-        },
-      }),
+  const body = JSON.stringify({
+    contents: [{
+      role: 'user',
+      parts: [
+        { inlineData: { mimeType: 'image/png', data: b64 } },
+        { text: prompt },
+      ],
+    }],
+    generationConfig: {
+      temperature: 0.25,
+      responseMimeType: 'application/json',
+      thinkingConfig,
     },
-  );
-  const data = await resp.json();
-  if (!resp.ok) throw new Error(data.error?.message || `HTTP ${resp.status}`);
-  const parts = data.candidates?.[0]?.content?.parts || [];
-  const textPart = [...parts].reverse().find((p) => typeof p.text === 'string' && !p.thought);
-  if (!textPart?.text) throw new Error('Gemini API returned no text output');
-  return { parsed: parseModelJsonResponse(textPart.text), model };
+  });
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  let lastErr = null;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 500));
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'superdmg-autoplay' },
+        body,
+        signal: AbortSignal.timeout(25000),
+      });
+      const rawText = await resp.text();
+      const parsedResp = parseHttpJsonSafe(rawText, resp.status);
+      if (!resp.ok || !parsedResp.ok) {
+        const apiMsg = parsedResp.data?.error?.message || parsedResp.message || `HTTP ${resp.status}`;
+        const transient = resp.status === 429 || resp.status >= 500 || !parsedResp.ok;
+        lastErr = new Error(apiMsg);
+        if (transient && attempt === 0) continue;
+        throw lastErr;
+      }
+      const data = parsedResp.data;
+      const parts = data.candidates?.[0]?.content?.parts || [];
+      const textPart = [...parts].reverse().find((p) => typeof p.text === 'string' && !p.thought);
+      if (!textPart?.text) throw new Error('Gemini API returned no text output');
+      return { parsed: parseModelJsonResponse(textPart.text), model };
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 0 && /timeout|aborted|fetch failed|HTTP 5\d\d|HTTP 429/i.test(String(err?.message || ''))) {
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr || new Error('Gemini API request failed');
 }
 
 /**

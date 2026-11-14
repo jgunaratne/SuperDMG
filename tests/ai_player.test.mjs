@@ -12,6 +12,7 @@ import {
   renderAnnotatedScreenPng,
   normalizeActionPlan,
   parseModelJsonResponse,
+  parseHttpJsonSafe,
   planNextMoves,
 } from '../tools/ai_player.mjs';
 import {
@@ -22,16 +23,16 @@ import { demoRom } from './helpers.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEPRECATED_AI_MODELS = ['gemini-2.5-flash', 'gemini-3.6-flash'];
-const SUPPORTED_AI_MODELS = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash'];
+const SUPPORTED_AI_MODELS = ['gemini-4-hydrogen', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash'];
 
-test('active AI autoplay model is gemini-3.8-flash and retired model IDs do not appear', () => {
-  assert.equal(DEFAULT_AI_MODEL, 'gemini-3.8-flash');
+test('active AI autoplay model is gemini-4-hydrogen and retired model IDs do not appear', () => {
+  assert.equal(DEFAULT_AI_MODEL, 'gemini-4-hydrogen');
   assert.ok(SUPPORTED_AI_MODELS.includes(DEFAULT_AI_MODEL));
   const prevModel = process.env.GEMINI_MODEL;
   delete process.env.GEMINI_MODEL;
   try {
     const status = aiPlayerStatus();
-    assert.ok(status.model.startsWith('gemini-3.8-flash'), `unexpected status model: ${status.model}`);
+    assert.ok(status.model.startsWith('gemini-4-hydrogen'), `unexpected status model: ${status.model}`);
   } finally {
     if (prevModel !== undefined) process.env.GEMINI_MODEL = prevModel;
   }
@@ -77,6 +78,10 @@ test('parseModelJsonResponse and normalizeActionPlan sanitize chords, bounds, an
 
   const fallback = normalizeActionPlan({ observation: 'Title screen', actions: [] });
   assert.deepEqual(fallback.actions, [{ button: 'start', buttons: ['start'], frames: 6 }]);
+
+  const gatewayErr = parseHttpJsonSafe('The backend server is temporarily unavailable.', 502);
+  assert.equal(gatewayErr.ok, false);
+  assert.match(gatewayErr.message, /HTTP 502: The backend server is temporarily unavailable/);
 });
 
 test('summarizeTurnOutcome distinguishes real movement from wall-blocked turns', () => {

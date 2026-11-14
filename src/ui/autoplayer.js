@@ -164,7 +164,7 @@ export class AutoPlayer {
     this.enabled = false;
     this.thinking = false;
     this.effort = 'low';
-    this.model = 'gemini-3.8-flash';
+    this.model = 'gemini-4-hydrogen';
     this.turnCount = 0;
     this.lastLatencyMs = 0;
     this.lastObservation = '';
@@ -327,14 +327,21 @@ export class AutoPlayer {
           history: this.history.slice(-6),
         }),
       });
-      const data = await response.json();
-      if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      const rawText = await response.text();
+      let data = null;
+      try {
+        data = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        const snippet = rawText.replace(/\s+/g, ' ').trim().slice(0, 80);
+        throw new Error(`Server unavailable (HTTP ${response.status}${snippet ? `: ${snippet}` : ''})`);
+      }
+      if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
       if (token !== this._token || !this.enabled || !this.emulator.loaded) return;
 
       this._consecutiveErrors = 0;
       this.thinking = false;
       this.turnCount++;
-      this.model = data.model || 'gemini-3.8-flash';
+      this.model = data.model || 'gemini-4-hydrogen';
       this.lastLatencyMs = Number(data.elapsedMs) || 0;
       this.lastObservation = data.observation || '';
       this.lastGoal = data.goal || '';
@@ -372,7 +379,7 @@ export class AutoPlayer {
       if (token !== this._token || !this.enabled) return;
       this.thinking = false;
       this._consecutiveErrors++;
-      if (this._consecutiveErrors >= 3) {
+      if (this._consecutiveErrors >= 5) {
         this.enabled = false;
         this._clearExecution();
         this.lastGoal = `Stopped: ${err.message}`;
@@ -380,11 +387,12 @@ export class AutoPlayer {
         this.onError(`AI autoplay stopped: ${err.message}`);
         return;
       }
-      this.lastGoal = `Retrying after error (${err.message})…`;
+      const delayMs = Math.min(3500, 800 * this._consecutiveErrors);
+      this.lastGoal = `Retrying (${this._consecutiveErrors}/4): ${err.message}`;
       this.onUpdate();
       this._retryTimer = setTimeout(() => {
         if (token === this._token && this.enabled) this._requestNextTurn();
-      }, 1200);
+      }, delayMs);
     }
   }
 
