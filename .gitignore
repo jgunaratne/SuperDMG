@@ -1,0 +1,10 @@
+# Third-party test ROMs fetched by tools/fetch_test_roms.sh
+test-roms/
+# Your own games: drop ROMs here if you like, they are never committed
+roms/local/
+# Scratch output from tools (screenshots, traces) and cached HD tile packs
+out/
+.cache/
+.env
+node_modules/
+.DS_Store
