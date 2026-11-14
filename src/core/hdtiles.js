@@ -328,24 +328,29 @@ export function shiftRgba32(rgba, dxPx, dyPx) {
   return out;
 }
 
-// --- Whole-ROM 2bpp Tile Scanner -------------------------------------------------------
+// --- Whole-ROM 2bpp Tile & Sprite-Strip Scanner ----------------------------------------
+
+export function isLikelySpriteTile(raw, st = tileStats(raw)) {
+  if (st.unique <= 1 || isGlyphTile(raw, st)) return false;
+  const fg = 64 - st.counts[0];
+  return fg >= 6 && fg <= 58 && st.borderZero >= 10 && st.counts[3] >= 3;
+}
 
 export function scoreRomArtTile(bytes, off) {
   let nonZeroBytes = 0;
   for (let i = 0; i < TILE_BYTES; i++) if (bytes[off + i] !== 0) nonZeroBytes++;
-  if (nonZeroBytes < 3) return 0;
+  if (nonZeroBytes < 2) return 0;
 
   const raw = decodeTile(bytes, off);
   const st = tileStats(raw);
   if (st.unique <= 1) return 0;
   const fg = 64 - st.counts[0];
-  if (fg < 4) return 0;
+  if (fg < 3) return 0;
 
-  let leftFg = 0, isolatedFg = 0, same = 0;
+  let isolatedFg = 0, same = 0;
   for (let y = 0; y < 8; y++) {
     for (let x = 0; x < 8; x++) {
       const c = raw[y * 8 + x];
-      if (c !== 0 && x < 5) leftFg++;
       if (x < 7 && c === raw[y * 8 + x + 1]) same++;
       if (y < 7 && c === raw[(y + 1) * 8 + x]) same++;
       if (c !== 0) {
@@ -358,36 +363,51 @@ export function scoreRomArtTile(bytes, off) {
       }
     }
   }
-  if (leftFg === 0 && fg < 20) return 0;
-  if (isolatedFg > fg * 0.45) return 0;
+  if (isolatedFg > fg * 0.62) return 0;
 
-  let asciiCount = 0, hasHighBit = false;
+  let asciiCount = 0, hasHighBit = false, planeOverlapRows = 0;
   for (let i = 0; i < TILE_BYTES; i++) {
     const b = bytes[off + i];
-    if ((b >= 0x20 && b <= 0x5a) || b === 0x00) asciiCount++;
+    if (b >= 0x20 && b <= 0x5a) asciiCount++;
     if (b & 0x80) hasHighBit = true;
   }
-  if (asciiCount >= 13 && !hasHighBit) return 0;
+  for (let r = 0; r < 8; r++) {
+    const b0 = bytes[off + r * 2], b1 = bytes[off + r * 2 + 1];
+    if ((b0 & b1) !== 0 || ((b0 | b1) !== 0 && ((b0 << 1) & b1) !== 0)) planeOverlapRows++;
+  }
+  if (asciiCount >= 15 && !hasHighBit) return 0;
 
-  return same / 112;
+  return (same / 112) + (planeOverlapRows >= 2 ? 0.06 : 0);
 }
 
-export function extractRomArtTiles(rom, maxTiles = 512) {
-  if (!rom || rom.length < 0x200) return [];
+/**
+ * Scans the entire Cartridge ROM (`$0150..end`) for uncompressed 2bpp graphics tiles AND
+ * groups contiguous sprite blocks into character animation strips (`spriteFamilies`) so
+ * all poses of each sprite in the ROM can be pre-colorized cohesively beforehand.
+ */
+export function extractRomGraphicsCatalog(rom, maxTiles = 8192) {
+  if (!rom || rom.length < 0x200) return { allKeys: [], spriteKeys: [], spriteFamilies: [] };
   const seen = new Set();
-  const keys = [];
+  const spriteSet = new Set();
+  const allKeys = [];
+  const spriteKeys = [];
+  const spriteFamilies = [];
   const CHUNK = 512;
 
-  for (let base = 0x150; base + 64 <= rom.length && keys.length < maxTiles; base += CHUNK) {
+  for (let base = 0x150; base + 32 <= rom.length && allKeys.length < maxTiles; base += CHUNK) {
     const end = Math.min(rom.length, base + CHUNK);
     let bestPhase = 0, bestScore = -1;
     for (let phase = 0; phase < 16; phase++) {
       let sum = 0, cnt = 0;
       for (let off = base + phase; off + TILE_BYTES <= end; off += TILE_BYTES) {
         const s = scoreRomArtTile(rom, off);
-        if (s >= 0.53) { sum += s; cnt++; }
+        if (s >= 0.44) { sum += s; cnt++; }
       }
-      if (cnt >= 5 && sum > bestScore) { bestScore = sum; bestPhase = phase; }
+      if (cnt >= 2) {
+        const alignWeight = phase === 0 ? 1.18 : (phase & 1) === 0 ? 1.06 : 1.0;
+        const weighted = sum * alignWeight;
+        if (weighted > bestScore) { bestScore = weighted; bestPhase = phase; }
+      }
     }
     if (bestScore < 0) continue;
 
@@ -397,30 +417,60 @@ export function extractRomArtTiles(rom, maxTiles = 512) {
     }
     let i = 0;
     while (i < slots.length) {
-      if (slots[i].score < 0.53) { i++; continue; }
+      if (slots[i].score < 0.44) { i++; continue; }
       let j = i, good = 0, gap = 0;
       while (j < slots.length) {
-        if (slots[j].score >= 0.51) { good++; gap = 0; j++; }
-        else if (gap < 1 && j + 1 < slots.length && slots[j + 1].score >= 0.55) { gap++; j++; }
+        if (slots[j].score >= 0.42) { good++; gap = 0; j++; }
+        else if (gap < 2 && j + 1 < slots.length && slots[j + 1].score >= 0.46) { gap++; j++; }
         else break;
       }
-      if (good >= 5) {
-        for (let k = i; k < j && keys.length < maxTiles; k++) {
-          if (slots[k].score < 0.49) continue;
+      if (good >= 2) {
+        let currentSprStrip = [];
+        for (let k = i; k < j && allKeys.length < maxTiles; k++) {
+          if (slots[k].score < 0.38) {
+            if (currentSprStrip.length >= 2) spriteFamilies.push(currentSprStrip);
+            currentSprStrip = [];
+            continue;
+          }
           const raw = decodeTile(rom, slots[k].off);
           const st = tileStats(raw);
-          if (st.unique <= 1 || isGlyphTile(raw, st)) continue;
+          if (st.unique <= 1 || isGlyphTile(raw, st)) {
+            if (currentSprStrip.length >= 2) spriteFamilies.push(currentSprStrip);
+            currentSprStrip = [];
+            continue;
+          }
           const key = tileFingerprint(rom, slots[k].off);
+          const isSpr = isLikelySpriteTile(raw, st);
           if (!seen.has(key)) {
             seen.add(key);
-            keys.push(key);
+            allKeys.push(key);
+          }
+          if (isSpr) {
+            if (!spriteSet.has(key)) {
+              spriteSet.add(key);
+              spriteKeys.push(key);
+            }
+            currentSprStrip.push(key);
+            // Group up to 12 sprite tiles (~3-6 character poses) per character strip
+            if (currentSprStrip.length >= 12) {
+              spriteFamilies.push(currentSprStrip);
+              currentSprStrip = [];
+            }
+          } else {
+            if (currentSprStrip.length >= 2) spriteFamilies.push(currentSprStrip);
+            currentSprStrip = [];
           }
         }
+        if (currentSprStrip.length >= 2) spriteFamilies.push(currentSprStrip);
       }
       i = j + 1;
     }
   }
-  return keys;
+  return { allKeys, spriteKeys, spriteFamilies };
+}
+
+export function extractRomArtTiles(rom, maxTiles = 8192) {
+  return extractRomGraphicsCatalog(rom, maxTiles).allKeys;
 }
 
 export function hasStablePalette(ppu) {
@@ -574,18 +624,43 @@ export function collectScreenTiles(ppu, title = '', rom = null) {
   }
 
   const sheetSet = new Set();
+  const spriteKeySet = new Set();
   const extraSheetKeys = [];
+  const spriteFamilies = [];
+
+  // Also group contiguous sprite tiles in VRAM sprite area ($8000-$8FFF = tiles 0..255)
+  let vramSprStrip = [];
   for (let t = 0; t < VRAM_TILES; t++) {
     const raw = decodeTile(vram, t * TILE_BYTES);
     const st = tileStats(raw);
-    if (st.unique <= 1 || isGlyphTile(raw, st)) continue;
+    if (st.unique <= 1 || isGlyphTile(raw, st)) {
+      if (vramSprStrip.length >= 2) spriteFamilies.push(vramSprStrip);
+      vramSprStrip = [];
+      continue;
+    }
     const key = tileFingerprint(vram, t * TILE_BYTES);
     if (!sheetSet.has(key)) { sheetSet.add(key); extraSheetKeys.push(key); }
+    if (t < 256 && isLikelySpriteTile(raw, st)) {
+      spriteKeySet.add(key);
+      vramSprStrip.push(key);
+      if (vramSprStrip.length >= 12) {
+        spriteFamilies.push(vramSprStrip);
+        vramSprStrip = [];
+      }
+    } else {
+      if (vramSprStrip.length >= 2) spriteFamilies.push(vramSprStrip);
+      vramSprStrip = [];
+    }
   }
+  if (vramSprStrip.length >= 2) spriteFamilies.push(vramSprStrip);
+
   if (rom) {
-    for (const key of extractRomArtTiles(rom, 512)) {
+    const catalog = extractRomGraphicsCatalog(rom, 8192);
+    for (const key of catalog.allKeys) {
       if (!sheetSet.has(key)) { sheetSet.add(key); extraSheetKeys.push(key); }
     }
+    for (const key of catalog.spriteKeys) spriteKeySet.add(key);
+    for (const fam of catalog.spriteFamilies) spriteFamilies.push(fam);
   }
 
   return {
@@ -598,6 +673,8 @@ export function collectScreenTiles(ppu, title = '', rom = null) {
     gridCells,
     spriteClusters,
     extraSheetKeys,
+    spriteSheetKeys: [...spriteKeySet],
+    spriteFamilies,
     tiles: tilesSummary,
   };
 }
@@ -670,6 +747,107 @@ export function materializeRgb24Tile32(raw64, rgb24, palReg, basePal = 0xe4, tra
   return out;
 }
 
+/**
+ * Extracts a clean median `[c1, c2, c3]` RGB palette for hardware sprite colors 1..3
+ * from an 8x8 `rgb24` buffer so every animation frame of a character shares uniform colors.
+ */
+export function extractSpriteShadePalette(raw64, rgb24) {
+  const buckets = [[], [], [], []];
+  for (let i = 0; i < 64; i++) {
+    const c = raw64[i] & 3;
+    if (c === 0) continue;
+    buckets[c].push([rgb24[i * 3], rgb24[i * 3 + 1], rgb24[i * 3 + 2]]);
+  }
+  const med = (arr) => {
+    if (!arr.length) return null;
+    const ch = (k) => arr.map((a) => a[k]).sort((a, b) => a - b)[arr.length >> 1];
+    return [ch(0), ch(1), ch(2)];
+  };
+  return [null, med(buckets[1]), med(buckets[2]), med(buckets[3])];
+}
+
+export function mergeSpriteShadePalette(base, extra) {
+  if (!base) return extra ? [...extra] : null;
+  if (!extra) return [...base];
+  return [
+    null,
+    base[1] || extra[1] || null,
+    base[2] || extra[2] || null,
+    base[3] || extra[3] || null,
+  ];
+}
+
+export function applySpriteShadePalette(raw64, pal3, fallbackRgb24 = null) {
+  const out = new Uint8Array(192);
+  const defaultC = [
+    [0, 0, 0],
+    pal3[1] || pal3[2] || [242, 206, 172],
+    pal3[2] || pal3[1] || [72, 132, 214],
+    pal3[3] || [26, 22, 32],
+  ];
+  for (let i = 0; i < 64; i++) {
+    const c = raw64[i] & 3;
+    if (c === 0) continue;
+    const chosen = pal3[c] || (fallbackRgb24
+      ? [fallbackRgb24[i * 3], fallbackRgb24[i * 3 + 1], fallbackRgb24[i * 3 + 2]]
+      : defaultC[c]);
+    out[i * 3] = chosen[0];
+    out[i * 3 + 1] = chosen[1];
+    out[i * 3 + 2] = chosen[2];
+  }
+  return out;
+}
+
+/**
+ * Computes a compact signature of the visible screen's non-solid art tile set so we can
+ * detect when the screen's tile context changes AND reuse cached scene colors on revisit.
+ */
+export function computeScreenContextSignature(ppu) {
+  const vram = ppu.vram;
+  const lowTiles = (ppu.lcdc & 0x10) !== 0;
+  const bgMap = ppu.lcdc & 0x08 ? 0x1c00 : 0x1800;
+  const winMap = ppu.lcdc & 0x40 ? 0x1c00 : 0x1800;
+  const windowOn = (ppu.lcdc & 0x21) === 0x21 && ppu.wy < SCREEN_H && ppu.wx <= 166;
+  const scxTile = ppu.scx >> 3;
+  const scyTile = ppu.scy >> 3;
+  const winStartRow = windowOn ? Math.max(0, Math.ceil(ppu.wy / 8)) : 18;
+  const winStartCol = windowOn ? Math.max(0, (ppu.wx - 7) >> 3) : 20;
+
+  const artKeys = new Set();
+  for (let gy = 0; gy < 18; gy++) {
+    for (let gx = 0; gx < 20; gx++) {
+      let t = -1;
+      const sampleInfo = ppu.bgInfo[(gy * 8 + 4) * SCREEN_W + (gx * 8 + 4)];
+      if (sampleInfo & INFO_VALID) {
+        t = sampleInfo & INFO_TILE_MASK;
+      } else if (windowOn && gy >= winStartRow && gx >= winStartCol) {
+        t = tileNumber(vram[winMap + (gy - winStartRow) * 32 + (gx - winStartCol)], lowTiles);
+      } else {
+        t = tileNumber(vram[bgMap + ((scyTile + gy) & 31) * 32 + ((scxTile + gx) & 31)], lowTiles);
+      }
+      const raw = decodeTile(vram, t * TILE_BYTES);
+      const st = tileStats(raw);
+      if (st.unique <= 1 || isGlyphTile(raw, st)) continue;
+      artKeys.add(tileFingerprint(vram, t * TILE_BYTES));
+    }
+  }
+  const sorted = [...artKeys].sort();
+  let h = 0x811c9dc5;
+  for (const k of sorted) {
+    for (let i = 0; i < k.length; i++) {
+      h ^= k.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+  }
+  return {
+    id: `${(h >>> 0).toString(16).padStart(8, '0')}:${sorted.length}`,
+    keys: sorted,
+  };
+}
+
+const MAX_TILE_HISTORY = 8;
+const MAX_SCENE_SNAPSHOTS = 24;
+
 export class HdTilePack {
   constructor(style = 'snes') {
     this.style = style;
@@ -677,6 +855,7 @@ export class HdTilePack {
     this.theme = '';
     this.model = '';
     this.wholeGameDone = false;
+    this.remainingCount = 0;
     this.themeColors = [[236, 232, 214], [148, 178, 112], [86, 114, 74], [28, 26, 32]];
     this.hudColors = [[246, 241, 230], [186, 162, 132], [108, 86, 72], [30, 24, 30]];
     this.hasTheme = false;
@@ -690,9 +869,21 @@ export class HdTilePack {
     this.sprRgb = new Map();
     this.winRgb = new Map();
 
+    /**
+     * Persistent history of original 16-byte tile fingerprint -> array of AI-generated variants:
+     * `nsKey -> Array<{ rgb24Base64, role, tier, pal, model, sceneId, ts }>`
+     */
+    this.tileHistory = new Map();
+    /** Cached per-screen tile color snapshots (`sceneId -> { keys, shades, hudShades, tiles }`). */
+    this.sceneSnapshots = new Map();
+
+    /** Moving OAM character/metasprite palette anchors so walking frames never shift colors. */
+    this.entityAnchors = [];
+    this.lockedSprPalettes = new Map();
+
     this.renderCache = new Map();
     this.missingKeys = new Set();
-    /** Keys currently visible on screen that only have blind 1D ROM-sheet starter colors (`tier: 'rom'`). */
+    /** Keys currently visible on screen that only have ROM-sheet starter colors (`tier: 'rom'`). */
     this.romTierOnScreen = new Set();
   }
 
@@ -705,10 +896,42 @@ export class HdTilePack {
     return all.size;
   }
 
-  ingest({ theme, model, wholeGameDone, shades, hudShades, groundKey, tiles = {} }) {
+  get historyCount() {
+    let total = 0;
+    for (const list of this.tileHistory.values()) total += list.length;
+    return total;
+  }
+
+  resetCharacterLocks() {
+    this.entityAnchors = [];
+    this.lockedSprPalettes.clear();
+  }
+
+  _recordVariant(nsKey, variant) {
+    if (!variant?.rgb24Base64) return;
+    let list = this.tileHistory.get(nsKey);
+    if (!list) {
+      list = [];
+      this.tileHistory.set(nsKey, list);
+    }
+    const existingIdx = list.findIndex((v) => v.rgb24Base64 === variant.rgb24Base64);
+    if (existingIdx >= 0) {
+      list[existingIdx] = { ...list[existingIdx], ...variant };
+      return;
+    }
+    list.push(variant);
+    if (list.length > MAX_TILE_HISTORY) list.shift();
+  }
+
+  ingest({
+    theme, model, wholeGameDone, remainingCount, shades, hudShades, groundKey,
+    sceneId = null, force = false, tiles = {}, history = null, sceneSnapshots = null,
+  }) {
+    if (force) this.resetCharacterLocks();
     if (theme) this.theme = theme;
     if (model) this.model = model;
-    if (wholeGameDone) this.wholeGameDone = true;
+    if (wholeGameDone !== undefined) this.wholeGameDone = Boolean(wholeGameDone);
+    if (typeof remainingCount === 'number') this.remainingCount = remainingCount;
     if (Array.isArray(shades) && shades.length === 4) {
       this.themeColors = shades.map((h, i) => parseHexRgb(h, this.themeColors[i]));
       this.hasTheme = true;
@@ -718,6 +941,20 @@ export class HdTilePack {
     }
     if (groundKey) this.groundKey = groundKey;
     this.renderCache.clear();
+
+    if (history && typeof history === 'object') {
+      for (const [nsKey, variants] of Object.entries(history)) {
+        if (!Array.isArray(variants)) continue;
+        for (const v of variants) this._recordVariant(nsKey, v);
+      }
+    }
+    if (sceneSnapshots && typeof sceneSnapshots === 'object') {
+      for (const [sid, snap] of Object.entries(sceneSnapshots)) {
+        if (snap && Array.isArray(snap.keys)) this.sceneSnapshots.set(sid, snap);
+      }
+    }
+
+    const sceneTilesSnap = sceneId ? {} : null;
 
     for (const entry of Object.values(tiles)) {
       if (!entry || !entry.key) continue;
@@ -741,26 +978,186 @@ export class HdTilePack {
       }
       if (!rgb24) continue;
 
+      const prefix = entry.role === 'spr' ? 'spr' : entry.role === 'win' ? 'win' : 'bg';
+      const nsKey = `${prefix}:${entry.key}`;
+      const incomingB64 = bytesToBase64(rgb24);
+
+      this._recordVariant(nsKey, {
+        key: entry.key,
+        role: entry.role || prefix,
+        tier,
+        pal: basePal,
+        model: model || this.model || '',
+        sceneId: sceneId || entry.sceneId || null,
+        ts: entry.ts || Date.now(),
+        rgb24Base64: incomingB64,
+      });
+
+      // Keep active moving character sprites locked to their established outfit palette unless forced!
+      if (prefix === 'spr' && !force && this.lockedSprPalettes.has(entry.key)) {
+        rgb24 = applySpriteShadePalette(raw64, this.lockedSprPalettes.get(entry.key), rgb24);
+      }
+
       const rec = { rgb24, rawBytes, basePal, surface: entry.role === 'surface', tier };
 
-      if (entry.role === 'spr') {
+      if (prefix === 'spr') {
         const prev = this.sprRgb.get(entry.key);
-        if (!prev || tier === 'scene' || prev.tier === 'rom') this.sprRgb.set(entry.key, rec);
+        if (force || !prev || tier === 'scene' || prev.tier === 'rom') this.sprRgb.set(entry.key, rec);
         if (!this.tileRgb.has(entry.key)) this.tileRgb.set(entry.key, rec);
         this.missingKeys.delete(`spr:${entry.key}`);
         if (tier === 'scene') this.romTierOnScreen.delete(`spr:${entry.key}`);
-      } else if (entry.role === 'win') {
+      } else if (prefix === 'win') {
         const prev = this.winRgb.get(entry.key);
-        if (!prev || tier === 'scene' || prev.tier === 'rom') this.winRgb.set(entry.key, rec);
+        if (force || !prev || tier === 'scene' || prev.tier === 'rom') this.winRgb.set(entry.key, rec);
         this.missingKeys.delete(`win:${entry.key}`);
         if (tier === 'scene') this.romTierOnScreen.delete(`win:${entry.key}`);
+        if (sceneTilesSnap && tier === 'scene') sceneTilesSnap[nsKey] = incomingB64;
       } else {
         const prev = this.tileRgb.get(entry.key);
-        if (!prev || tier === 'scene' || prev.tier === 'rom') this.tileRgb.set(entry.key, rec);
+        if (force || !prev || tier === 'scene' || prev.tier === 'rom') this.tileRgb.set(entry.key, rec);
         this.missingKeys.delete(`bg:${entry.key}`);
         if (tier === 'scene') this.romTierOnScreen.delete(`bg:${entry.key}`);
+        if (sceneTilesSnap && tier === 'scene') sceneTilesSnap[nsKey] = incomingB64;
       }
     }
+
+    if (sceneId && sceneTilesSnap && Object.keys(sceneTilesSnap).length > 0) {
+      const toHex = ([r, g, b]) => `#${HEX_BYTE[r]}${HEX_BYTE[g]}${HEX_BYTE[b]}`;
+      this.sceneSnapshots.set(sceneId, {
+        keys: Object.keys(sceneTilesSnap).map((k) => k.slice(k.indexOf(':') + 1)),
+        shades: this.themeColors.map(toHex),
+        hudShades: this.hudColors.map(toHex),
+        tiles: sceneTilesSnap,
+        ts: Date.now(),
+      });
+      if (this.sceneSnapshots.size > MAX_SCENE_SNAPSHOTS) {
+        const oldest = this.sceneSnapshots.keys().next().value;
+        this.sceneSnapshots.delete(oldest);
+      }
+    }
+  }
+
+  /**
+   * Checks whether a screen context (`{ id, keys }`) already has a cached scene snapshot
+   * (>= 75% tile overlap), and if so restores those cached tile colors + theme immediately!
+   */
+  restoreCachedSceneIfAvailable(sig) {
+    if (!sig || !sig.keys || sig.keys.length === 0) return false;
+    let chosen = this.sceneSnapshots.get(sig.id) || null;
+    if (!chosen) {
+      const targetSet = new Set(sig.keys);
+      let bestSim = 0;
+      for (const snap of this.sceneSnapshots.values()) {
+        if (!Array.isArray(snap.keys) || !snap.keys.length) continue;
+        let inter = 0;
+        for (const k of snap.keys) if (targetSet.has(k)) inter++;
+        const union = targetSet.size + snap.keys.length - inter;
+        const sim = union > 0 ? inter / union : 0;
+        if (sim >= 0.78 && sim > bestSim) {
+          bestSim = sim;
+          chosen = snap;
+        }
+      }
+    }
+    if (!chosen) return false;
+
+    if (Array.isArray(chosen.shades) && chosen.shades.length === 4) {
+      this.themeColors = chosen.shades.map((h, i) => parseHexRgb(h, this.themeColors[i]));
+      this.hasTheme = true;
+    }
+    if (Array.isArray(chosen.hudShades) && chosen.hudShades.length === 4) {
+      this.hudColors = chosen.hudShades.map((h, i) => parseHexRgb(h, this.hudColors[i]));
+    }
+    for (const [nsKey, b64] of Object.entries(chosen.tiles || {})) {
+      const sep = nsKey.indexOf(':');
+      const prefix = nsKey.slice(0, sep);
+      const key = nsKey.slice(sep + 1);
+      const map = prefix === 'win' ? this.winRgb : this.tileRgb;
+      const prev = map.get(key);
+      const rgb24 = base64ToBytes(b64);
+      if (rgb24.length !== 192) continue;
+      map.set(key, {
+        rgb24,
+        rawBytes: prev?.rawBytes || hexToTileBytes(key),
+        basePal: prev?.basePal ?? 0xe4,
+        surface: prev?.surface ?? false,
+        tier: 'scene',
+      });
+      this.romTierOnScreen.delete(`${prefix}:${key}`);
+      this.missingKeys.delete(`${prefix}:${key}`);
+    }
+    this.renderCache.clear();
+    return true;
+  }
+
+  /** Returns cached AI history variants for the inspected tile so the user can view & reuse any version. */
+  getTileHistoryVariants(bytes, tileOrOffset, ppu, isRomOffset = false) {
+    const offset = isRomOffset ? tileOrOffset : tileOrOffset * TILE_BYTES;
+    if (offset < 0 || offset + TILE_BYTES > bytes.length) return [];
+    const key = tileFingerprint(bytes, offset);
+    const raw64 = decodeTile(bytes, offset);
+    if (tileStats(raw64).unique <= 1) return [];
+
+    const prefix = this.sprRgb.has(key) ? 'spr' : this.winRgb.has(key) ? 'win' : 'bg';
+    const nsKey = `${prefix}:${key}`;
+    const list = this.tileHistory.get(nsKey) || this.tileHistory.get(`bg:${key}`) || this.tileHistory.get(`spr:${key}`) || [];
+    if (!list.length) return [];
+
+    const activeRec = prefix === 'spr' ? this.sprRgb.get(key) : prefix === 'win' ? this.winRgb.get(key) : this.tileRgb.get(key);
+    const activeB64 = activeRec ? bytesToBase64(activeRec.rgb24) : '';
+    const palReg = prefix === 'spr' ? ppu.obp0 : ppu.bgp;
+
+    return list.map((v, idx) => {
+      const rgb24 = base64ToBytes(v.rgb24Base64);
+      const rgba = materializeRgb24Tile32(raw64, rgb24, palReg, v.pal ?? palReg, prefix === 'spr');
+      if (prefix === 'spr') {
+        for (let i = 0; i < 1024; i++) {
+          if (rgba[i * 4 + 3] === 0) {
+            rgba[i * 4] = 42; rgba[i * 4 + 1] = 44; rgba[i * 4 + 2] = 55; rgba[i * 4 + 3] = 255;
+          }
+        }
+      }
+      return {
+        nsKey: this.tileHistory.has(nsKey) ? nsKey : (this.tileHistory.has(`spr:${key}`) ? `spr:${key}` : `bg:${key}`),
+        index: idx,
+        tier: v.tier,
+        model: v.model || '',
+        ts: v.ts || 0,
+        active: v.rgb24Base64 === activeB64,
+        rgba,
+      };
+    });
+  }
+
+  selectTileHistoryVariant(nsKey, index) {
+    const list = this.tileHistory.get(nsKey);
+    if (!list || !list[index]) return false;
+    const chosen = list[index];
+    const sep = nsKey.indexOf(':');
+    const prefix = nsKey.slice(0, sep);
+    const key = nsKey.slice(sep + 1);
+    const rgb24 = base64ToBytes(chosen.rgb24Base64);
+    if (rgb24.length !== 192) return false;
+    const rawBytes = hexToTileBytes(key);
+    const raw64 = decodeTile(rawBytes, 0);
+    const rec = {
+      rgb24,
+      rawBytes,
+      basePal: chosen.pal ?? 0xe4,
+      surface: chosen.role === 'surface',
+      tier: 'scene',
+    };
+    if (prefix === 'spr') {
+      this.sprRgb.set(key, rec);
+      this.tileRgb.set(key, rec);
+      this.lockedSprPalettes.set(key, extractSpriteShadePalette(raw64, rgb24));
+    } else if (prefix === 'win') {
+      this.winRgb.set(key, rec);
+    } else {
+      this.tileRgb.set(key, rec);
+    }
+    this.renderCache.clear();
+    return true;
   }
 
   toRecord() {
@@ -783,16 +1180,24 @@ export class HdTilePack {
         rgb24Base64: bytesToBase64(v.rgb24),
       };
     }
+    const history = {};
+    for (const [nsKey, list] of this.tileHistory) history[nsKey] = list;
+    const sceneSnapshots = {};
+    for (const [sid, snap] of this.sceneSnapshots) sceneSnapshots[sid] = snap;
+
     const toHex = ([r, g, b]) => `#${HEX_BYTE[r]}${HEX_BYTE[g]}${HEX_BYTE[b]}`;
     return {
       style: this.style,
       theme: this.theme,
       model: this.model,
       wholeGameDone: this.wholeGameDone,
+      remainingCount: this.remainingCount,
       groundKey: this.groundKey,
       shades: this.themeColors.map(toHex),
       hudShades: this.hudColors.map(toHex),
       tiles,
+      history,
+      sceneSnapshots,
     };
   }
 
@@ -916,6 +1321,144 @@ export class HdTilePack {
     return rgba;
   }
 
+  /**
+   * Keeps moving OAM character/metasprite clusters locked to one consistent `(upper, lower)`
+   * `[c1, c2, c3]` color palette as they alternate between walking, turning, or DMA-updated
+   * tile frames so a character never changes colors mid-step.
+   */
+  syncMovingSpritePalettes(ppu) {
+    if (!(ppu.lcdc & 0x02)) return;
+    const vram = ppu.vram;
+    const onScreen = readSprites(ppu.oam, ppu.lcdc).filter((s) => s.onScreen);
+    if (!onScreen.length) return;
+
+    const visited = new Set();
+    const clusters = [];
+    for (let i = 0; i < onScreen.length; i++) {
+      if (visited.has(i)) continue;
+      const group = [onScreen[i]];
+      visited.add(i);
+      let grew = true;
+      while (grew) {
+        grew = false;
+        for (let j = 0; j < onScreen.length; j++) {
+          if (visited.has(j)) continue;
+          const cand = onScreen[j];
+          if (cand.palette !== group[0].palette) continue;
+          const touches = group.some((g) =>
+            cand.x <= g.x + 8 && cand.x + 8 >= g.x &&
+            cand.y <= g.y + g.height && cand.y + cand.height >= g.y,
+          );
+          if (touches) { group.push(cand); visited.add(j); grew = true; }
+        }
+      }
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const s of group) {
+        minX = Math.min(minX, s.x); minY = Math.min(minY, s.y);
+        maxX = Math.max(maxX, s.x + 8); maxY = Math.max(maxY, s.y + s.height);
+      }
+      clusters.push({
+        cx: (minX + maxX) * 0.5,
+        cy: (minY + maxY) * 0.5,
+        minY,
+        h: maxY - minY,
+        obpSlot: group[0].palette,
+        palReg: group[0].palette ? ppu.obp1 : ppu.obp0,
+        group,
+      });
+    }
+
+    const usedAnchors = new Set();
+    const nextAnchors = [];
+    let cacheInvalidated = false;
+
+    for (const cl of clusters) {
+      let bestAnchor = null, bestDist = 22;
+      for (let ai = 0; ai < this.entityAnchors.length; ai++) {
+        if (usedAnchors.has(ai)) continue;
+        const a = this.entityAnchors[ai];
+        if (a.obpSlot !== cl.obpSlot) continue;
+        const d = Math.hypot(cl.cx - a.cx, cl.cy - a.cy);
+        if (d < bestDist) { bestDist = d; bestAnchor = a; usedAnchors.add(ai); }
+      }
+
+      const anchor = bestAnchor || {
+        cx: cl.cx, cy: cl.cy, obpSlot: cl.obpSlot,
+        upperPal: null, lowerPal: null, sceneSeeded: false, syncedKeys: new Set(),
+      };
+      anchor.cx = cl.cx;
+      anchor.cy = cl.cy;
+
+      // Pass 1: seed/upgrade anchor upper & lower palettes (preferring `scene`-tier over `rom`-tier)
+      for (const tierPass of ['scene', 'rom']) {
+        if (tierPass === 'rom' && anchor.sceneSeeded) continue;
+        for (const s of cl.group) {
+          const topIdx = s.height === 16 ? (s.tile & 0xfe) : s.tile;
+          const slices = s.height === 16 ? [0, 8] : [0];
+          for (const yOff of slices) {
+            const tileIdx = yOff === 8 ? topIdx + 1 : topIdx;
+            const key = tileFingerprint(vram, tileIdx * TILE_BYTES);
+            const rec = this.sprRgb.get(key) || this.tileRgb.get(key);
+            if (!rec || rec.tier !== tierPass) continue;
+            const raw64 = decodeTile(vram, tileIdx * TILE_BYTES);
+            if (tileStats(raw64).unique <= 1) continue;
+            const pal3 = extractSpriteShadePalette(raw64, rec.rgb24);
+            const isLower = cl.h > 8 && (s.y + yOff - cl.minY) >= (cl.h * 0.45);
+            if (tierPass === 'scene' && !anchor.sceneSeeded) {
+              anchor.upperPal = null;
+              anchor.lowerPal = null;
+              anchor.syncedKeys.clear();
+              anchor.sceneSeeded = true;
+            }
+            if (isLower) anchor.lowerPal = mergeSpriteShadePalette(anchor.lowerPal, pal3);
+            else anchor.upperPal = mergeSpriteShadePalette(anchor.upperPal, pal3);
+          }
+        }
+      }
+      if (anchor.upperPal && !anchor.lowerPal) anchor.lowerPal = anchor.upperPal;
+      if (anchor.lowerPal && !anchor.upperPal) anchor.upperPal = anchor.lowerPal;
+
+      // Pass 2: harmonize every tile slice in this moving cluster onto the locked palette!
+      if (anchor.upperPal || anchor.lowerPal) {
+        for (const s of cl.group) {
+          const topIdx = s.height === 16 ? (s.tile & 0xfe) : s.tile;
+          const slices = s.height === 16 ? [0, 8] : [0];
+          for (const yOff of slices) {
+            const tileIdx = yOff === 8 ? topIdx + 1 : topIdx;
+            const key = tileFingerprint(vram, tileIdx * TILE_BYTES);
+            const isLower = cl.h > 8 && (s.y + yOff - cl.minY) >= (cl.h * 0.45);
+            const targetPal = (isLower ? anchor.lowerPal : anchor.upperPal) || anchor.upperPal || anchor.lowerPal;
+            const bandTag = `${isLower ? 'L' : 'U'}:${key}`;
+            if (anchor.syncedKeys.has(bandTag) && this.sprRgb.has(key)) continue;
+
+            const rawBytes = vram.slice(tileIdx * TILE_BYTES, (tileIdx + 1) * TILE_BYTES);
+            const raw64 = decodeTile(rawBytes, 0);
+            if (tileStats(raw64).unique <= 1) continue;
+
+            const prev = this.sprRgb.get(key) || this.tileRgb.get(key);
+            const harmonized = applySpriteShadePalette(raw64, targetPal, prev?.rgb24 || null);
+            this.sprRgb.set(key, {
+              rgb24: harmonized,
+              rawBytes,
+              basePal: prev?.basePal ?? cl.palReg,
+              surface: false,
+              tier: prev?.tier === 'scene' ? 'scene' : (prev ? prev.tier : 'scene'),
+            });
+            this.lockedSprPalettes.set(key, targetPal);
+            this.missingKeys.delete(`spr:${key}`);
+            anchor.syncedKeys.add(bandTag);
+            cacheInvalidated = true;
+          }
+        }
+      }
+
+      nextAnchors.push(anchor);
+    }
+
+    this.entityAnchors = nextAnchors;
+    if (cacheInvalidated) this.renderCache.clear();
+  }
+
   renderHdFrame(ppu, fallbackPacked4, outU32) {
     this.romTierOnScreen.clear();
     if (!(ppu.lcdc & 0x80)) {
@@ -924,6 +1467,7 @@ export class HdTilePack {
       return;
     }
 
+    this.syncMovingSpritePalettes(ppu);
     const { vram, bgInfo, objInfo, bgPix, objPix, bgp, obp0, obp1, oam } = ppu;
     const fallbackBackdrop = this.hasTheme
       ? packRgba(this.themeColors[0][0], this.themeColors[0][1], this.themeColors[0][2], 255)

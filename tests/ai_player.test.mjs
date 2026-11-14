@@ -131,9 +131,11 @@ test('heuristic backend executes closed-loop autoplay steps offline', async () =
         screenShadesBase64: bytesToBase64(gb.ppu.display),
         telemetry: before,
         history,
+        userGuidance: ['Walk right along row 1 first.'],
       });
       assert.equal(res.ok, true);
       assert.ok(res.actions.length >= 1);
+      assert.ok(typeof res.thought === 'string' && res.thought.length > 0, 'returns thinking trace');
       for (const act of res.actions) {
         for (const b of act.buttons) gb.setButton(b, true);
         for (let f = 0; f < act.frames; f++) gb.runFrame();

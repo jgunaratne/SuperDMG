@@ -301,11 +301,29 @@ function formatAsciiTileGrid(telemetry = {}) {
   return lines.join('\n');
 }
 
+function extractUserGuidanceText(payload = {}) {
+  const chunks = [];
+  if (Array.isArray(payload.userGuidance)) {
+    for (const item of payload.userGuidance.slice(-8)) {
+      const s = String(typeof item === 'string' ? item : item?.text || '').trim();
+      if (s) chunks.push(s);
+    }
+  } else if (typeof payload.userGuidance === 'string' && payload.userGuidance.trim()) {
+    chunks.push(payload.userGuidance.trim());
+  }
+  if (typeof payload.draftGuidance === 'string' && payload.draftGuidance.trim()) {
+    const draft = payload.draftGuidance.trim();
+    if (!chunks.includes(draft)) chunks.push(`(Live note) ${draft}`);
+  }
+  return chunks.join('\n---\n').slice(0, 6000);
+}
+
 function buildPrompt(payload) {
   const title = String(payload.title || 'Game Boy ROM').trim();
   const t = payload.telemetry || {};
   const sprites = Array.isArray(t.sprites) ? t.sprites : [];
   const history = Array.isArray(payload.history) ? payload.history.slice(-6) : [];
+  const guidanceText = extractUserGuidanceText(payload);
 
   const spriteLines = sprites.length
     ? sprites.slice(0, 8).map((s) => {
@@ -343,6 +361,12 @@ function buildPrompt(payload) {
     'RECENT TURN MEMORY:',
     historyLines,
     stuckWarning,
+    ...(guidanceText ? [
+      'HUMAN CO-PILOT HINTS & INSTRUCTIONS (HIGH PRIORITY):',
+      'The human player provided the following instructions, hints, or walkthrough notes to assist you. Follow their strategic/tactical guidance closely while adapting button frame counts to the exact current screen positions:',
+      guidanceText,
+      '',
+    ] : []),
     'GAMEPLAY & TIMING RULES:',
     '1. Identify the game state first:',
     '   - Title screen / "PRESS START" / Game Over / "YOU WIN": press `{"button": "start", "frames": 6}` (or `"a"`).',
@@ -424,12 +448,18 @@ function runHeuristicPlanner(payload) {
   const history = Array.isArray(payload.history) ? payload.history : [];
   const lastBlocked = history.length > 0 && history[history.length - 1].blocked;
 
+  const guidanceText = extractUserGuidanceText(payload);
   if (!sprites.length) {
-    return normalizeActionPlan({
-      observation: 'No active player sprite on screen; likely a title or menu screen.',
-      goal: 'Press Start and A to begin or advance the screen.',
-      actions: [{ button: 'start', frames: 6 }, { button: 'a', frames: 6 }],
-    });
+    return {
+      ...normalizeActionPlan({
+        observation: 'No active player sprite on screen; likely a title or menu screen.',
+        goal: 'Press Start and A to begin or advance the screen.',
+        actions: [{ button: 'start', frames: 6 }, { button: 'a', frames: 6 }],
+      }),
+      thought: guidanceText
+        ? `No sprites on screen yet. Incorporating user hint ("${guidanceText.slice(0, 120)}") and pressing Start/A.`
+        : 'No sprites on screen yet; pressing Start and A to enter gameplay.',
+    };
   }
 
   const sp = sprites[0];
@@ -444,9 +474,10 @@ function runHeuristicPlanner(payload) {
     { button: 'up', dc: 0, dr: -1 },
   ];
   const lastBtn = history.length ? String(history[history.length - 1].actions || '').split(/\s+/)[0] : '';
+  const hintedDir = dirs.find((d) => new RegExp(`\\b${d.button}\\b`, 'i').test(guidanceText));
 
-  let chosen = dirs[(history.length) % dirs.length];
-  if (cells) {
+  let chosen = hintedDir || dirs[(history.length) % dirs.length];
+  if (!hintedDir && cells) {
     const floor = cells[row * 20 + col];
     const open = dirs.filter(({ dc, dr, button }) => {
       const nc = col + dc, nr = row + dr;
@@ -456,16 +487,23 @@ function runHeuristicPlanner(payload) {
       return tile === floor || tile < 3;
     });
     if (open.length) chosen = open[history.length % open.length];
-  } else if (lastBlocked) {
+  } else if (!hintedDir && lastBlocked) {
     const alt = dirs.filter((d) => d.button !== lastBtn);
     chosen = alt[history.length % alt.length];
   }
 
-  return normalizeActionPlan({
-    observation: `Character sprite #0 at tile (${col}, ${row}).`,
-    goal: `Move ${chosen.button} to explore the area.`,
-    actions: [{ button: chosen.button, frames: 16 }],
-  });
+  return {
+    ...normalizeActionPlan({
+      observation: `Character sprite #0 at tile (${col}, ${row}).`,
+      goal: guidanceText
+        ? `Follow user guidance and move ${chosen.button}.`
+        : `Move ${chosen.button} to explore the area.`,
+      actions: [{ button: chosen.button, frames: 16 }],
+    }),
+    thought: guidanceText
+      ? `Checked character at (${col}, ${row}) and applied user assistance ("${guidanceText.slice(0, 140)}") -> moving ${chosen.button}.`
+      : `Evaluated neighbors around (${col}, ${row}) and selected open direction ${chosen.button}.`,
+  };
 }
 
 export function parseHttpJsonSafe(rawText, status) {
@@ -487,7 +525,7 @@ async function callGeminiPlanner({ imagePath, prompt, effortLevel }) {
 
   const b64 = fs.readFileSync(imagePath).toString('base64');
   const model = resolveAiModel();
-  const thinkingConfig = { thinkingLevel: effortLevel, includeThoughts: false };
+  const thinkingConfig = { thinkingLevel: effortLevel, includeThoughts: true };
   const body = JSON.stringify({
     contents: [{
       role: 'user',
@@ -526,9 +564,15 @@ async function callGeminiPlanner({ imagePath, prompt, effortLevel }) {
       }
       const data = parsedResp.data;
       const parts = data.candidates?.[0]?.content?.parts || [];
+      const thought = parts
+        .filter((p) => p.thought && typeof p.text === 'string')
+        .map((p) => p.text.trim())
+        .filter(Boolean)
+        .join('\n\n')
+        .slice(0, 4000);
       const textPart = [...parts].reverse().find((p) => typeof p.text === 'string' && !p.thought);
       if (!textPart?.text) throw new Error('Gemini API returned no text output');
-      return { parsed: parseModelJsonResponse(textPart.text), model };
+      return { parsed: parseModelJsonResponse(textPart.text), thought, model };
     } catch (err) {
       lastErr = err;
       if (attempt === 0 && /timeout|aborted|fetch failed|HTTP 5\d\d|HTTP 429/i.test(String(err?.message || ''))) {
@@ -573,7 +617,7 @@ export async function planNextMoves(payload = {}) {
     fs.writeFileSync(imagePath, png);
 
     const prompt = buildPrompt(payload);
-    const { parsed, model } = await callGeminiPlanner({
+    const { parsed, thought, model } = await callGeminiPlanner({
       imagePath,
       prompt,
       effortLevel: effortSpec.level,
@@ -583,6 +627,7 @@ export async function planNextMoves(payload = {}) {
       ok: true,
       model,
       effort: effortSpec.id,
+      thought: thought || '',
       ...plan,
       elapsedMs: Date.now() - tStart,
     };

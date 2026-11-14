@@ -154,10 +154,11 @@ export class AutoPlayer {
    *   onError?: Function,
    * }} deps
    */
-  constructor({ emulator, screen, input, onUpdate, onError }) {
+  constructor({ emulator, screen, input, getDraftGuidance, onUpdate, onError }) {
     this.emulator = emulator;
     this.screen = screen;
     this.input = input;
+    this.getDraftGuidance = getDraftGuidance || (() => '');
     this.onUpdate = onUpdate || (() => {});
     this.onError = onError || (() => {});
 
@@ -167,13 +168,19 @@ export class AutoPlayer {
     this.model = 'gemini-4-hydrogen';
     this.turnCount = 0;
     this.lastLatencyMs = 0;
+    this.lastThought = '';
     this.lastObservation = '';
     this.lastGoal = '';
     this.plannedSteps = [];
     this.activeStepIndex = -1;
     this.activeButtons = [];
     this.history = [];
+    this.userNotes = [];
+    this.thinkingLog = [];
+    this.logRevision = 0;
 
+    this._nextLogId = 1;
+    this._activeLogEntry = null;
     this._token = 0;
     this._queue = [];
     this._currentItem = null;
@@ -189,6 +196,72 @@ export class AutoPlayer {
     this.emulator.addEventListener('frame', () => this._onFrame());
     this.emulator.addEventListener('load', () => this._onRomChange());
     this.emulator.addEventListener('reset', () => this._onRomChange());
+  }
+
+  _bumpLog() {
+    this.logRevision++;
+  }
+
+  /**
+   * Appends typed or pasted instructions/walkthrough text from the user to guide
+   * the AI player, interrupting any in-flight plan so the AI adapts immediately.
+   */
+  addUserGuidance(rawText) {
+    const text = String(rawText ?? '').trim().slice(0, 4000);
+    if (!text) return false;
+    this.userNotes.push(text);
+    if (this.userNotes.length > 8) this.userNotes.shift();
+
+    this.thinkingLog.push({
+      id: this._nextLogId++,
+      kind: 'user',
+      text,
+      timestamp: Date.now(),
+    });
+    if (this.thinkingLog.length > 60) this.thinkingLog.shift();
+    this._bumpLog();
+
+    if (this.enabled && this.emulator.loaded) {
+      // Finalize any interrupted turn walk and immediately re-plan with the new guidance.
+      if (this._activeLogEntry && this._activeLogEntry.pending) {
+        const snap = captureTelemetrySnapshot(this.emulator.gb);
+        const out = summarizeTurnOutcome(this._turnBeforeSnap, snap);
+        this._activeLogEntry.pending = false;
+        this._activeLogEntry.outcome = `${out.text} (redirected by your hint)`;
+        this._activeLogEntry.moved = out.moved;
+        this._activeLogEntry.blocked = false;
+        this._activeLogEntry = null;
+      }
+      clearTimeout(this._retryTimer);
+      this._token++;
+      this._clearExecution();
+      this.thinking = false;
+      this.lastGoal = 'Applying your hint and re-planning…';
+      this.onUpdate();
+      this._requestNextTurn();
+    } else {
+      this.onUpdate();
+    }
+    return true;
+  }
+
+  clearUserGuidance() {
+    if (!this.userNotes.length) return;
+    this.userNotes = [];
+    this._bumpLog();
+    this.onUpdate();
+  }
+
+  clearHistory() {
+    this.history = [];
+    this.userNotes = [];
+    this.thinkingLog = [];
+    this._activeLogEntry = null;
+    this.lastThought = '';
+    this.lastObservation = '';
+    if (!this.enabled) this.lastGoal = '';
+    this._bumpLog();
+    this.onUpdate();
   }
 
   setEffort(effort) {
@@ -212,7 +285,13 @@ export class AutoPlayer {
     this._clearExecution();
 
     if (!this.enabled) {
+      if (this._activeLogEntry && this._activeLogEntry.pending) {
+        this._activeLogEntry.pending = false;
+        this._activeLogEntry.outcome = 'Stopped by user';
+        this._activeLogEntry = null;
+      }
       this.thinking = false;
+      this._bumpLog();
       this.onUpdate();
       return false;
     }
@@ -220,6 +299,7 @@ export class AutoPlayer {
     this._consecutiveErrors = 0;
     if (this.emulator.paused) this.emulator.setPaused(false);
     this.lastGoal = 'Looking at the screen with Gemini…';
+    this._bumpLog();
     this.onUpdate();
     this._requestNextTurn();
     return true;
@@ -232,10 +312,13 @@ export class AutoPlayer {
     this.thinking = false;
     this.turnCount = 0;
     this.history = [];
+    this._activeLogEntry = null;
+    this.lastThought = '';
     this.lastObservation = '';
     this.lastGoal = this.enabled ? 'Game restarted — inspecting new screen…' : '';
     this.plannedSteps = [];
     this.activeStepIndex = -1;
+    this._bumpLog();
     this.onUpdate();
     if (this.enabled && this.emulator.loaded) {
       this._retryTimer = setTimeout(() => {
@@ -303,9 +386,11 @@ export class AutoPlayer {
 
     this.thinking = true;
     this.activeStepIndex = -1;
+    this._bumpLog();
     this.onUpdate();
 
     try {
+      const draftGuidance = String(this.getDraftGuidance() || '').trim();
       const response = await fetch('api/ai/act', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -325,6 +410,8 @@ export class AutoPlayer {
             windowRows: snap.windowRows,
           },
           history: this.history.slice(-6),
+          userGuidance: this.userNotes.slice(-8),
+          draftGuidance,
         }),
       });
       const rawText = await response.text();
@@ -343,6 +430,7 @@ export class AutoPlayer {
       this.turnCount++;
       this.model = data.model || 'gemini-4-hydrogen';
       this.lastLatencyMs = Number(data.elapsedMs) || 0;
+      this.lastThought = String(data.thought || '').trim();
       this.lastObservation = data.observation || '';
       this.lastGoal = data.goal || '';
 
@@ -356,6 +444,28 @@ export class AutoPlayer {
         frames: Math.max(3, Math.min(80, Number(a.frames) || 12)),
         label: formatActionLabel(a),
       }));
+
+      const logEntry = {
+        id: this._nextLogId++,
+        kind: 'turn',
+        turn: this.turnCount,
+        model: this.model,
+        effort: this.effort,
+        latencyMs: this.lastLatencyMs,
+        thought: this.lastThought,
+        observation: this.lastObservation,
+        goal: this.lastGoal,
+        actions: this.plannedSteps.map((s) => s.label),
+        outcome: '',
+        moved: false,
+        blocked: false,
+        pending: true,
+        timestamp: Date.now(),
+      };
+      this.thinkingLog.push(logEntry);
+      if (this.thinkingLog.length > 60) this.thinkingLog.shift();
+      this._activeLogEntry = logEntry;
+      this._bumpLog();
 
       // Build frame execution queue with crisp 3-frame release gaps between steps.
       this._turnBeforeSnap = captureTelemetrySnapshot(this.emulator.gb);
@@ -378,6 +488,7 @@ export class AutoPlayer {
     } catch (err) {
       if (token !== this._token || !this.enabled) return;
       this.thinking = false;
+      this._bumpLog();
       this._consecutiveErrors++;
       if (this._consecutiveErrors >= 5) {
         this.enabled = false;
@@ -445,6 +556,13 @@ export class AutoPlayer {
       if (this._settleFrames === 0) {
         const afterSnap = captureTelemetrySnapshot(this.emulator.gb);
         const outcome = summarizeTurnOutcome(this._turnBeforeSnap, afterSnap);
+        if (this._activeLogEntry) {
+          this._activeLogEntry.pending = false;
+          this._activeLogEntry.outcome = outcome.text;
+          this._activeLogEntry.moved = outcome.moved;
+          this._activeLogEntry.blocked = outcome.blocked;
+          this._activeLogEntry = null;
+        }
         this.history.push({
           turn: this.turnCount,
           goal: this.lastGoal,
@@ -455,6 +573,7 @@ export class AutoPlayer {
         });
         if (this.history.length > 8) this.history.shift();
         this.activeStepIndex = -1;
+        this._bumpLog();
         this.onUpdate();
         this._requestNextTurn();
       }

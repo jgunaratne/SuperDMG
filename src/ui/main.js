@@ -10,7 +10,8 @@ import { PALETTES, findPalette, packPalette } from './palettes.js';
 import { downloadBlob } from './pixelview.js';
 import { looksLikeZip, romFromZip } from './unzip.js';
 import {
-  HD_STYLES, HdTilePack, collectScreenTiles, hasStablePalette, bytesToBase64,
+  HD_STYLES, HdTilePack, collectScreenTiles, computeScreenContextSignature,
+  hasStablePalette, bytesToBase64,
 } from '../core/hdtiles.js';
 import { MIDI_PRESETS } from '../core/midi.js';
 import { loadElevenLabsInstrumentBank } from './samples.js';
@@ -37,6 +38,12 @@ audio.setMuted(settings.muted);
 const emulator = new Emulator(audio);
 const screen = new Screen($('lcd'), $('lcd-canvas'), $('lcd-overlay'));
 const explorer = new Explorer(emulator, screen, settings, persist);
+explorer.onHdVariantSelect = () => {
+  drawCurrentScreen();
+  if (hdPack && emulator.loaded) {
+    storeHdPack(currentCartId(), hdPack.style, hdPack.toRecord());
+  }
+};
 
 // --- Messages --------------------------------------------------------------------------
 
@@ -57,7 +64,13 @@ let hdBusy = false;
 let hdPack = null;
 let hdToken = 0;
 let autoUpgradeTimer = 0;
+let bgRomDrainTimer = 0;
+let frameWatchTick = 0;
+let activeSceneSig = null;
+let pendingSettleSigId = '';
+let pendingSettleCount = 0;
 const attemptedMissing = new Set();
+const attemptedSceneIds = new Set();
 
 for (const style of HD_STYLES) {
   const option = document.createElement('option');
@@ -101,35 +114,56 @@ async function ensurePackForCurrentRom() {
   return new HdTilePack(style);
 }
 
-async function upgradeVisibleTiles({ force = false, reviseScene = false } = {}) {
+async function upgradeVisibleTiles({ force = false, reviseScene = false, sheetsOnly = false } = {}) {
   if (!emulator.loaded || hdBusy) return false;
   const token = ++hdToken;
   const cart = emulator.gb.cart;
   const cartId = currentCartId();
   const style = $('hd-style').value;
 
-  if (!hdPack || hdPack.style !== style) {
-    hdPack = force ? new HdTilePack(style) : await ensurePackForCurrentRom();
+  if (!hdPack) {
+    hdPack = await ensurePackForCurrentRom();
+    if (token !== hdToken) return false;
+    if (hdEnabled) explorer.setHdPack(hdPack);
+  } else if (hdPack.style !== style) {
+    hdPack = await ensurePackForCurrentRom();
     if (token !== hdToken) return false;
     if (hdEnabled) explorer.setHdPack(hdPack);
   }
 
   // Wait briefly if the ROM just booted or is mid-fade before capturing the screen.
-  for (let wait = 0; wait < 8; wait++) {
-    const ready = emulator.gb.ppu.frameCount >= 2 && hasStablePalette(emulator.gb.ppu);
-    if (ready || emulator.paused) break;
-    await new Promise((r) => setTimeout(r, 55));
-    if (token !== hdToken || !emulator.loaded) return false;
+  if (!sheetsOnly) {
+    for (let wait = 0; wait < 8; wait++) {
+      const ready = emulator.gb.ppu.frameCount >= 2 && hasStablePalette(emulator.gb.ppu);
+      if (ready || emulator.paused) break;
+      await new Promise((r) => setTimeout(r, 55));
+      if (token !== hdToken || !emulator.loaded) return false;
+    }
   }
 
-  const includeRom = force || !hdPack.wholeGameDone;
+  const screenSig = computeScreenContextSignature(emulator.gb.ppu);
+
+  // If this screen context was already colorized earlier in this session/history, reuse its cached tiles immediately!
+  if (!force && !sheetsOnly && hdPack.restoreCachedSceneIfAvailable(screenSig)) {
+    activeSceneSig = screenSig;
+    attemptedSceneIds.add(screenSig.id);
+    drawCurrentScreen();
+    explorer.refresh(true);
+    if (hdPack.wholeGameDone) {
+      const styleName = HD_STYLES.find((s) => s.id === style)?.name || style;
+      setHdStatus(`${styleName} active · Reused cached scene (${hdPack.count} tiles, ${hdPack.historyCount} saved in history).`);
+      return true;
+    }
+  }
+
+  const includeRom = force || sheetsOnly || !hdPack.wholeGameDone;
   const captured = collectScreenTiles(
     emulator.gb.ppu,
     cart.header.title || emulator.romName,
     includeRom ? cart.rom : null,
   );
   const isSceneTier = (map, key) => map.get(key)?.tier === 'scene';
-  const artTiles = captured.tiles.filter((t) => {
+  const artTiles = sheetsOnly ? [] : captured.tiles.filter((t) => {
     if (t.role === 'solid' || t.glyph) return false;
     if (force || reviseScene) return true;
     if (t.role === 'hud') return !isSceneTier(hdPack.winTiles, t.key) && !isSceneTier(hdPack.bgTiles, t.key);
@@ -138,9 +172,15 @@ async function upgradeVisibleTiles({ force = false, reviseScene = false } = {}) 
     return !isSceneTier(hdPack.bgTiles, t.key);
   });
 
-  if (!force && !reviseScene && !includeRom && artTiles.length === 0 && hdPack.count > 0) {
+  const uncachedExtraKeys = captured.extraSheetKeys.filter(
+    (k) => !hdPack.bgTiles.has(k) && !hdPack.sprTiles.has(k),
+  );
+
+  if (!force && !reviseScene && uncachedExtraKeys.length === 0 && artTiles.length === 0 && hdPack.count > 0) {
+    hdPack.wholeGameDone = true;
+    activeSceneSig = screenSig;
     const styleName = HD_STYLES.find((s) => s.id === style)?.name || style;
-    setHdStatus(`${styleName} active · ${hdPack.count} colorized game tiles ready (pixel-locked).`);
+    setHdStatus(`${styleName} active · ${hdPack.count} cached game tiles ready (${hdPack.historyCount} in history).`);
     drawCurrentScreen();
     explorer.refresh(true);
     return true;
@@ -150,17 +190,19 @@ async function upgradeVisibleTiles({ force = false, reviseScene = false } = {}) 
     attemptedMissing.add(`${t.role.startsWith('spr') ? 'spr' : 'bg'}:${t.key}`);
     if (t.pairKey) attemptedMissing.add(`spr:${t.pairKey}`);
   }
+  if (!sheetsOnly) attemptedSceneIds.add(screenSig.id);
 
   hdBusy = true;
   syncHdControls();
   setHdStatus(
-    includeRom
-      ? `Colorizing whole-game ROM + VRAM tiles with Gemini…`
-      : `Revising current screen colors with Gemini…`,
+    sheetsOnly
+      ? `Pre-colorizing remaining ROM sprites & tiles from current screen context (${hdPack.count} cached)…`
+      : includeRom
+        ? `Colorizing current screen + pre-caching ROM sprites & tiles…`
+        : `Regenerating tile colors for current screen context…`,
   );
 
   try {
-    if (force) await deleteHdPack(cartId, style);
     const response = await fetch('api/tiles/upgrade', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -170,6 +212,8 @@ async function upgradeVisibleTiles({ force = false, reviseScene = false } = {}) 
         style,
         force,
         reviseScene,
+        sheetsOnly,
+        sceneId: screenSig.id,
         bgp: captured.bgp,
         obp0: captured.obp0,
         obp1: captured.obp1,
@@ -177,7 +221,9 @@ async function upgradeVisibleTiles({ force = false, reviseScene = false } = {}) 
         screenShadesBase64: bytesToBase64(captured.shades),
         gridCells: captured.gridCells,
         spriteClusters: captured.spriteClusters,
-        extraSheetKeys: includeRom ? captured.extraSheetKeys : [],
+        extraSheetKeys: force ? captured.extraSheetKeys : uncachedExtraKeys,
+        spriteSheetKeys: captured.spriteSheetKeys,
+        spriteFamilies: captured.spriteFamilies,
         tiles: captured.tiles,
       }),
     });
@@ -185,8 +231,8 @@ async function upgradeVisibleTiles({ force = false, reviseScene = false } = {}) 
     if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
     if (token !== hdToken) return false;
 
-    if (force) hdPack = new HdTilePack(style);
-    hdPack.ingest(data);
+    hdPack.ingest({ ...data, force, sceneId: sheetsOnly ? null : screenSig.id });
+    if (!sheetsOnly) activeSceneSig = screenSig;
     await storeHdPack(cartId, style, hdPack.toRecord());
 
     if (hdEnabled) explorer.setHdPack(hdPack);
@@ -195,11 +241,24 @@ async function upgradeVisibleTiles({ force = false, reviseScene = false } = {}) 
 
     const styleName = HD_STYLES.find((s) => s.id === style)?.name || style;
     const secs = ((data.elapsedMs || 0) / 1000).toFixed(1);
+    const rem = Number(data.remainingCount) || 0;
     setHdStatus(
-      data.cached
-        ? `${styleName} active · ${hdPack.count} colorized game tiles ready (pixel-locked).`
-        : `${styleName} active · ${hdPack.count} game tiles colorized in ${secs}s via ${data.model} (pixel-locked).`,
+      rem > 0
+        ? `${styleName} active · ${hdPack.count} tiles cached (${rem} more ROM tiles pre-colorizing in background…)`
+        : data.cached
+          ? `${styleName} active · ${hdPack.count} cached game tiles ready (${hdPack.historyCount} saved in history).`
+          : `${styleName} active · ${hdPack.count} game tiles colorized in ${secs}s (${hdPack.historyCount} saved in history).`,
     );
+
+    // Continue pre-colorizing remaining Cartridge ROM batches in the background until 100% cached!
+    clearTimeout(bgRomDrainTimer);
+    if (rem > 0 && hdEnabled && settings.hdAuto) {
+      bgRomDrainTimer = setTimeout(() => {
+        if (hdEnabled && settings.hdAuto && !hdBusy && emulator.loaded) {
+          upgradeVisibleTiles({ force: false, reviseScene: false, sheetsOnly: true });
+        }
+      }, 450);
+    }
     return true;
   } catch (err) {
     if (token === hdToken) {
@@ -211,6 +270,7 @@ async function upgradeVisibleTiles({ force = false, reviseScene = false } = {}) 
     if (token === hdToken) {
       hdBusy = false;
       syncHdControls();
+      if (hdEnabled && settings.hdAuto) scheduleAutoUpgradeIfNeeded(true);
     }
   }
 }
@@ -238,28 +298,70 @@ function toggleHdMode() {
   setHdMode(!hdEnabled);
 }
 
-function scheduleAutoUpgradeIfNeeded() {
-  if (!hdEnabled || !settings.hdAuto || hdBusy || !hdPack) return;
-  const needsScenePromotion = hdPack.romTierOnScreen.size >= 3;
-  if (hdPack.missingKeys.size === 0 && !needsScenePromotion) return;
+function screenSimilarity(sigA, sigB) {
+  if (!sigA || !sigB || !sigA.keys.length || !sigB.keys.length) return 0;
+  const setA = new Set(sigA.keys);
+  let inter = 0;
+  for (const k of sigB.keys) if (setA.has(k)) inter++;
+  const union = setA.size + sigB.keys.length - inter;
+  return union > 0 ? inter / union : 1;
+}
+
+function scheduleAutoUpgradeIfNeeded(immediateCheck = false) {
+  if (!hdEnabled || !settings.hdAuto || hdBusy || !hdPack || !emulator.loaded) return;
+  if (!immediateCheck && (++frameWatchTick % 12) !== 0) return;
   if (!hasStablePalette(emulator.gb.ppu)) return;
+
+  const sig = computeScreenContextSignature(emulator.gb.ppu);
+
+  // 1. If the screen switched to a previously colorized scene, restore its cached tiles immediately!
+  if (activeSceneSig && sig.id !== activeSceneSig.id && screenSimilarity(activeSceneSig, sig) < 0.72) {
+    if (hdPack.restoreCachedSceneIfAvailable(sig)) {
+      activeSceneSig = sig;
+      drawCurrentScreen();
+      explorer.refresh(true);
+      return;
+    }
+  }
+
+  // 2. Check if new uncached tiles appeared, ROM-tier tiles entered screen, or screen tileset changed!
   let hasFreshMissing = false;
   for (const k of hdPack.missingKeys) {
     if (!attemptedMissing.has(k)) { hasFreshMissing = true; break; }
   }
-  if (!hasFreshMissing && needsScenePromotion) {
+  let hasFreshRomPromo = false;
+  if (hdPack.romTierOnScreen.size >= 1) {
     for (const k of hdPack.romTierOnScreen) {
-      if (!attemptedMissing.has(`scene:${k}`)) { hasFreshMissing = true; break; }
+      if (!attemptedMissing.has(`scene:${k}`)) { hasFreshRomPromo = true; break; }
     }
   }
-  if (!hasFreshMissing) return;
+  const sceneChangedSignificantly = Boolean(
+    sig.keys.length >= 2 &&
+    activeSceneSig &&
+    screenSimilarity(activeSceneSig, sig) < 0.68 &&
+    !attemptedSceneIds.has(sig.id),
+  );
+
+  if (!hasFreshMissing && !hasFreshRomPromo && !sceneChangedSignificantly) return;
+
+  // Require 2 consecutive stable checks (~200ms) so mid-scroll / mid-wipe frames are skipped cleanly.
+  if (!immediateCheck) {
+    if (pendingSettleSigId !== sig.id) {
+      pendingSettleSigId = sig.id;
+      pendingSettleCount = 1;
+      return;
+    }
+    pendingSettleCount++;
+    if (pendingSettleCount < 2) return;
+  }
+
   clearTimeout(autoUpgradeTimer);
   autoUpgradeTimer = setTimeout(() => {
     if (hdEnabled && settings.hdAuto && !hdBusy && hasStablePalette(emulator.gb.ppu)) {
       for (const k of hdPack.romTierOnScreen) attemptedMissing.add(`scene:${k}`);
       upgradeVisibleTiles({ force: false, reviseScene: true });
     }
-  }, 380);
+  }, 240);
 }
 
 $('btn-hd-mode').addEventListener('click', toggleHdMode);
@@ -465,7 +567,10 @@ emulator.addEventListener('load', async () => {
   for (const b of transportButtons) b.disabled = false;
   lastSaved = 0;
   clearTimeout(autoUpgradeTimer);
+  clearTimeout(bgRomDrainTimer);
   attemptedMissing.clear();
+  attemptedSceneIds.clear();
+  activeSceneSig = null;
   hdToken++;
   hdBusy = false;
   hdPack = null;
@@ -641,7 +746,123 @@ if (!AI_EFFORT_OPTIONS.some((e) => e.id === settings.aiEffort)) settings.aiEffor
 $('ai-effort').value = settings.aiEffort;
 
 const padButtonEls = [...$('pad').querySelectorAll('[data-button]')];
-const DEFAULT_AI_PROMPT = 'Check to let Gemini inspect the screen, decide what to do next, and move the character automatically.';
+const DEFAULT_AI_PROMPT = 'Check AI Autoplay to let Gemini 4 Hydrogen inspect the screen, decide what to do next, and move the character automatically.';
+let renderedLogRev = -1;
+
+function cleanThoughtDisplay(raw) {
+  return String(raw || '')
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function renderAiLog() {
+  if (!autoPlayer || renderedLogRev === autoPlayer.logRevision) return;
+  renderedLogRev = autoPlayer.logRevision;
+
+  const logEl = $('ai-log');
+  const nearBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 56;
+  const entries = autoPlayer.thinkingLog;
+
+  if (!entries.length && !autoPlayer.thinking) {
+    const empty = document.createElement('p');
+    empty.className = 'ai-log-empty';
+    empty.id = 'ai-log-empty';
+    empty.textContent = 'Thinking history will appear here turn by turn once AI Autoplay starts. Type or paste hints, walkthrough steps, or goals below to steer the AI.';
+    logEl.replaceChildren(empty);
+    return;
+  }
+
+  const nodes = [];
+  for (const entry of entries) {
+    if (entry.kind === 'user') {
+      const card = document.createElement('div');
+      card.className = 'ai-entry ai-entry-user';
+      const head = document.createElement('div');
+      head.className = 'ai-entry-head';
+      const tag = document.createElement('span');
+      tag.className = 'ai-entry-tag';
+      tag.textContent = 'You · Hint';
+      const time = document.createElement('span');
+      time.className = 'mono';
+      time.textContent = new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      head.append(tag, time);
+
+      const body = document.createElement('div');
+      body.className = 'ai-entry-user-text';
+      body.textContent = entry.text;
+      card.append(head, body);
+      nodes.push(card);
+      continue;
+    }
+
+    const card = document.createElement('div');
+    card.className = 'ai-entry';
+
+    const head = document.createElement('div');
+    head.className = 'ai-entry-head';
+    const tag = document.createElement('span');
+    tag.className = 'ai-entry-tag';
+    tag.textContent = `Turn #${entry.turn}`;
+    const timing = document.createElement('span');
+    timing.className = 'mono';
+    timing.textContent = entry.latencyMs > 0 ? `${(entry.latencyMs / 1000).toFixed(1)}s · ${entry.effort}` : entry.effort;
+    const steps = document.createElement('span');
+    steps.className = 'ai-entry-steps';
+    steps.textContent = entry.actions.join(' → ');
+    const outcome = document.createElement('span');
+    outcome.className = `ai-entry-outcome${entry.blocked ? ' blocked' : entry.moved ? ' ok' : ''}`;
+    outcome.textContent = entry.pending
+      ? 'Executing…'
+      : entry.blocked
+        ? 'Blocked'
+        : entry.moved
+          ? 'Moved'
+          : (entry.outcome || 'Done');
+    if (entry.outcome) outcome.title = entry.outcome;
+    head.append(tag, timing, steps, outcome);
+    card.append(head);
+
+    if (entry.goal) {
+      const goalEl = document.createElement('div');
+      goalEl.className = 'ai-entry-goal';
+      goalEl.textContent = entry.goal;
+      card.append(goalEl);
+    }
+    if (entry.observation) {
+      const obsEl = document.createElement('div');
+      obsEl.className = 'ai-entry-obs';
+      obsEl.textContent = entry.observation;
+      card.append(obsEl);
+    }
+    const cleanedThought = cleanThoughtDisplay(entry.thought);
+    if (cleanedThought) {
+      const thoughtEl = document.createElement('div');
+      thoughtEl.className = 'ai-entry-thought';
+      thoughtEl.textContent = cleanedThought;
+      card.append(thoughtEl);
+    }
+    nodes.push(card);
+  }
+
+  if (autoPlayer.thinking) {
+    const card = document.createElement('div');
+    card.className = 'ai-entry ai-entry-thinking';
+    const head = document.createElement('div');
+    head.className = 'ai-entry-head';
+    const tag = document.createElement('span');
+    tag.className = 'ai-entry-tag';
+    tag.textContent = `Turn #${autoPlayer.turnCount + 1}`;
+    const status = document.createElement('span');
+    status.textContent = `Thinking with ${autoPlayer.model} (${autoPlayer.effort})…`;
+    head.append(tag, status);
+    card.append(head);
+    nodes.push(card);
+  }
+
+  logEl.replaceChildren(...nodes);
+  if (nearBottom) logEl.scrollTop = logEl.scrollHeight;
+}
 
 function syncAiControls() {
   if (!autoPlayer) return;
@@ -651,6 +872,7 @@ function syncAiControls() {
   $('ai-play').checked = active;
   $('ai-effort').disabled = !loaded;
   $('ai-effort').value = autoPlayer.effort;
+  $('ai-model-badge').textContent = autoPlayer.model || 'gemini-4-hydrogen';
   $('ai-panel').classList.toggle('active', active);
   $('ai-panel').classList.toggle('thinking', active && autoPlayer.thinking);
   $('lcd').classList.toggle('ai-active', active);
@@ -679,24 +901,28 @@ function syncAiControls() {
   }
 
   if (active) {
-    $('ai-goal').textContent = autoPlayer.lastGoal || 'Looking at the screen with Gemini…';
-    const metaParts = [];
-    if (autoPlayer.thinking) metaParts.push('Thinking with Gemini…');
-    else if (autoPlayer.turnCount > 0) {
-      metaParts.push(`Turn ${autoPlayer.turnCount}`);
-      if (autoPlayer.lastLatencyMs > 0) metaParts.push(`${(autoPlayer.lastLatencyMs / 1000).toFixed(1)}s`);
-    }
-    if (autoPlayer.lastObservation) metaParts.push(autoPlayer.lastObservation);
-    $('ai-meta').textContent = metaParts.join(' · ');
-    $('ai-meta').hidden = metaParts.length === 0;
+    $('ai-goal').textContent = autoPlayer.thinking
+      ? `Thinking (Turn #${autoPlayer.turnCount + 1})…`
+      : (autoPlayer.lastGoal || 'Looking at the screen with Gemini 4 Hydrogen…');
   } else {
     $('ai-goal').textContent = autoPlayer.lastGoal && autoPlayer.lastGoal.startsWith('Stopped:')
       ? autoPlayer.lastGoal
       : DEFAULT_AI_PROMPT;
-    $('ai-meta').textContent = '';
-    $('ai-meta').hidden = true;
   }
 
+  const notes = autoPlayer.userNotes;
+  const notesBar = $('ai-notes-bar');
+  if (notes.length > 0) {
+    const latest = notes[notes.length - 1].replace(/\s+/g, ' ');
+    $('ai-notes-summary').textContent = notes.length === 1
+      ? `Active hint: "${latest}"`
+      : `Active hints (${notes.length}): latest "${latest}"`;
+    notesBar.hidden = false;
+  } else {
+    notesBar.hidden = true;
+  }
+
+  renderAiLog();
   updateFlag();
 }
 
@@ -704,11 +930,20 @@ autoPlayer = new AutoPlayer({
   emulator,
   screen,
   input,
+  getDraftGuidance: () => $('ai-assist-input').value,
   onUpdate: syncAiControls,
   onError: (msg) => toast(msg, true),
 });
 autoPlayer.setEffort(settings.aiEffort);
 syncAiControls();
+
+function submitAiAssist() {
+  const inputEl = $('ai-assist-input');
+  const text = inputEl.value.trim();
+  if (!text) return;
+  inputEl.value = '';
+  autoPlayer.addUserGuidance(text);
+}
 
 $('ai-play').addEventListener('change', (e) => {
   audio.unlock();
@@ -720,11 +955,28 @@ $('ai-effort').addEventListener('change', (e) => {
   persist();
   if (emulator.loaded) $('lcd').focus({ preventScroll: true });
 });
+$('btn-ai-clear').addEventListener('click', () => {
+  autoPlayer.clearHistory();
+});
+$('btn-ai-clear-notes').addEventListener('click', () => {
+  autoPlayer.clearUserGuidance();
+});
+$('ai-assist-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  submitAiAssist();
+});
+$('ai-assist-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    submitAiAssist();
+  }
+});
 
 // Mouse clicks on controls should not take the keyboard away from the game: hand
 // focus back to the screen afterwards. Keyboard users keep normal focus behaviour.
 document.addEventListener('click', (e) => {
   if (e.detail === 0) return; // activated from the keyboard
+  if (e.target.closest('.ai-assist, .ai-log, .ai-notes-bar, #btn-ai-clear')) return;
   const control = e.target.closest('button, input[type="checkbox"], input[type="range"], [role="tab"]');
   if (control && emulator.loaded) $('lcd').focus({ preventScroll: true });
 });
@@ -764,13 +1016,19 @@ const ai = {
   get thinking() { return autoPlayer.thinking; },
   get turnCount() { return autoPlayer.turnCount; },
   get effort() { return autoPlayer.effort; },
+  get lastThought() { return autoPlayer.lastThought; },
   get lastGoal() { return autoPlayer.lastGoal; },
   get lastObservation() { return autoPlayer.lastObservation; },
   get activeButtons() { return [...autoPlayer.activeButtons]; },
   get plannedSteps() { return [...autoPlayer.plannedSteps]; },
   get history() { return [...autoPlayer.history]; },
+  get thinkingLog() { return [...autoPlayer.thinkingLog]; },
+  get userNotes() { return [...autoPlayer.userNotes]; },
   setEnabled: (on) => autoPlayer.setEnabled(on),
   toggle: () => autoPlayer.toggle(),
+  assist: (text) => autoPlayer.addUserGuidance(text),
+  clearHistory: () => autoPlayer.clearHistory(),
+  clearGuidance: () => autoPlayer.clearUserGuidance(),
   setEffort: (effort) => {
     settings.aiEffort = effort;
     autoPlayer.setEffort(effort);

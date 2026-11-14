@@ -78,21 +78,6 @@
         <p class="hd-status" id="hd-status" role="status" aria-live="polite">Colorizes whole-game tiles in-place via Gemini while keeping exact Game Boy pixel positions.</p>
       </div>
 
-      <div class="panel ai-panel" id="ai-panel" aria-label="AI Autoplay">
-        <div class="ai-head">
-          <label class="check ai-toggle" title="Let Gemini watch the screen and play automatically (G)">
-            <input type="checkbox" id="ai-play" disabled>
-            <span class="ai-toggle-label">AI Autoplay</span>
-          </label>
-          <label class="field">Thinking
-            <select id="ai-effort" aria-label="AI Autoplay thinking effort"></select>
-          </label>
-        </div>
-        <div class="ai-actions" id="ai-actions" aria-live="off" hidden></div>
-        <p class="ai-goal" id="ai-goal" role="status" aria-live="polite">Check to let Gemini inspect the screen, decide what to do next, and move the character automatically.</p>
-        <p class="ai-meta" id="ai-meta" hidden></p>
-      </div>
-
       <div class="pad" id="pad" aria-label="On-screen controls">
         <div class="dpad">
           <button type="button" data-button="up" aria-label="Up"></button>
@@ -167,7 +152,46 @@
       </div>
     </section>
 
-    <section class="explorer" aria-labelledby="explorer-heading">
+    <div class="right-col">
+      <section class="panel ai-panel" id="ai-panel" aria-labelledby="ai-heading">
+        <div class="ai-head">
+          <div class="ai-head-left">
+            <h2 id="ai-heading" class="ai-section-title">AI Gameplay</h2>
+            <label class="check ai-toggle" title="Let Gemini 4 Hydrogen watch the screen and play automatically (G)">
+              <input type="checkbox" id="ai-play" disabled>
+              <span class="ai-toggle-label">AI Autoplay</span>
+            </label>
+            <span class="ai-model-badge mono" id="ai-model-badge">gemini-4-hydrogen</span>
+          </div>
+          <div class="ai-head-right">
+            <label class="field">Thinking
+              <select id="ai-effort" aria-label="AI Autoplay thinking effort"></select>
+            </label>
+            <button class="btn btn-small" id="btn-ai-clear" type="button" title="Clear thinking history and active hints">Clear</button>
+          </div>
+        </div>
+
+        <div class="ai-live">
+          <p class="ai-goal" id="ai-goal" role="status" aria-live="polite">Check AI Autoplay to let Gemini 4 Hydrogen inspect the screen, decide what to do next, and move the character automatically.</p>
+          <div class="ai-actions" id="ai-actions" aria-live="off" hidden></div>
+        </div>
+
+        <div class="ai-log" id="ai-log" role="log" aria-live="off" aria-label="AI thinking history">
+          <p class="ai-log-empty" id="ai-log-empty">Thinking history will appear here turn by turn once AI Autoplay starts. Type or paste hints, walkthrough steps, or goals below to steer the AI.</p>
+        </div>
+
+        <div class="ai-notes-bar" id="ai-notes-bar" hidden>
+          <span class="ai-notes-summary" id="ai-notes-summary"></span>
+          <button class="btn btn-small" id="btn-ai-clear-notes" type="button">Clear hints</button>
+        </div>
+
+        <form class="ai-assist" id="ai-assist-form">
+          <textarea id="ai-assist-input" rows="2" aria-label="Assist AI gameplay" placeholder="Type or paste hints, walkthrough notes, or instructions to assist AI gameplay (Enter to send, Shift+Enter for newline)…"></textarea>
+          <button class="btn btn-primary btn-small" id="btn-ai-send" type="submit">Send hint</button>
+        </form>
+      </section>
+
+      <section class="explorer" aria-labelledby="explorer-heading">
       <div class="explorer-head">
         <h2 id="explorer-heading">Explorer</h2>
         <div class="tabs" role="tablist" aria-label="Explorer views">
@@ -263,6 +287,10 @@
                 <button class="btn btn-small" id="btn-hd-tile-png" type="button">Save HD PNG</button>
               </div>
               <canvas id="insp-hd-canvas" width="32" height="32"></canvas>
+              <div class="insp-hd-history" id="insp-hd-history" hidden>
+                <span class="insp-hd-hist-label" id="insp-hd-hist-label">Cached AI history</span>
+                <div class="insp-hd-variants" id="insp-hd-variants" role="list"></div>
+              </div>
             </div>
             <dl class="facts mono" id="insp-facts"></dl>
             <div class="usage" id="insp-usage"></div>
@@ -275,12 +303,13 @@
         </aside>
       </div>
 
-      <footer class="ppu" aria-label="Video registers">
-        <div class="ppu-flags" id="ppu-flags"></div>
-        <dl class="ppu-values mono" id="ppu-values"></dl>
-        <div class="ppu-palettes" id="ppu-palettes"></div>
-      </footer>
-    </section>
+        <footer class="ppu" aria-label="Video registers">
+          <div class="ppu-flags" id="ppu-flags"></div>
+          <dl class="ppu-values mono" id="ppu-values"></dl>
+          <div class="ppu-palettes" id="ppu-palettes"></div>
+        </footer>
+      </section>
+    </div>
 
   </main>
 

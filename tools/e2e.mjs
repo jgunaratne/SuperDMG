@@ -274,11 +274,22 @@ try {
   console.log('ai autoplay');
   const aiStatus = await page.eval(`fetch('api/ai/status').then((r) => r.json())`);
   check(aiStatus && aiStatus.available, `AI autoplay server ready (backend: ${aiStatus?.backend}, model: ${aiStatus?.model})`);
+  check(await page.eval('Boolean(document.querySelector(".right-col #ai-panel") && !document.querySelector(".console #ai-panel"))'), 'AI Gameplay panel lives on the right column');
   check(!(await page.eval('document.getElementById("ai-play").checked')), 'AI Autoplay unchecked by default');
   await page.clickOn('#btn-reset');
   await page.sleep(200);
   const aiX0 = await peek(0xc400);
   const aiY0 = await peek(0xc401);
+  // Type & paste assistance into #ai-assist-input and verify it neither moves the character nor triggers hotkeys
+  await page.clickOn('#ai-assist-input');
+  await page.eval(`(() => {
+    const el = document.getElementById('ai-assist-input');
+    el.value = 'Walk right along the top corridor toward the gem at (9, 2).';
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await page.clickOn('#btn-ai-send');
+  check(await page.eval('gameboy.ai.userNotes.length === 1 && !document.getElementById("ai-notes-bar").hidden'), 'submitted user hint is stored and shown in active hints bar');
+  check(await page.eval('document.querySelectorAll("#ai-log .ai-entry-user").length === 1'), 'user hint appears in the thinking history log');
   await page.clickOn('#ai-play');
   check(await page.eval('gameboy.ai.enabled && document.getElementById("ai-play").checked'), 'checking #ai-play enables AI Autoplay');
   await page.waitFor(
@@ -286,7 +297,53 @@ try {
     45000,
   );
   const aiGoal = await text('#ai-goal');
-  check(aiGoal.length > 5 && !aiGoal.startsWith('Check to let'), `AI Autoplay displays its decision (${aiGoal.slice(0, 60)})`);
+  check(aiGoal.length > 5 && !aiGoal.startsWith('Check AI Autoplay'), `AI Autoplay displays its decision (${aiGoal.slice(0, 60)})`);
+  check(await page.eval('document.querySelectorAll("#ai-log .ai-entry").length >= 2'), 'thinking history log displays both user hint and AI turn entry');
+  // Stress-test CSS containment with multiple long multi-paragraph thoughts + long unbroken tokens + long pasted note
+  const cssContainment = await page.eval(`(() => {
+    const longThought = Array.from({ length: 8 }, (_, i) =>
+      'Step ' + (i + 1) + ': Evaluating corridor geometry and obstacle coordinates ' + 'X'.repeat(120)
+    ).join('\\n\\n');
+    for (let k = 0; k < 5; k++) {
+      gameboy.ai.assist('Long walkthrough paragraph #' + (k + 1) + ': ' + 'Walk east along row 1 then south around the hedge wall. '.repeat(8) + 'TOKEN_' + 'A'.repeat(140));
+    }
+    // Also inject long thoughts onto existing turn entries and force re-render
+    for (const entry of gameboy.ai.thinkingLog) {
+      if (entry.kind === 'turn') entry.thought = longThought;
+    }
+    gameboy.ai.assist('Final stress hint check.');
+    const panel = document.getElementById('ai-panel');
+    const rightCol = document.querySelector('.right-col');
+    const log = document.getElementById('ai-log');
+    const entries = [...log.querySelectorAll('.ai-entry')];
+    const pRect = panel.getBoundingClientRect();
+    const rRect = rightCol.getBoundingClientRect();
+    let overlaps = 0;
+    let childOverflow = 0;
+    for (let i = 0; i < entries.length; i++) {
+      const eRect = entries[i].getBoundingClientRect();
+      if (eRect.width > log.clientWidth + 1) childOverflow++;
+      if (i > 0) {
+        const prevRect = entries[i - 1].getBoundingClientRect();
+        if (eRect.top < prevRect.bottom - 0.5) overlaps++;
+      }
+      for (const child of entries[i].children) {
+        const cRect = child.getBoundingClientRect();
+        if (cRect.bottom > eRect.bottom + 1 || cRect.right > eRect.right + 1) childOverflow++;
+      }
+    }
+    return {
+      panelFitsRightCol: pRect.width <= rRect.width + 1 && panel.scrollWidth <= panel.clientWidth + 1,
+      logNoHorizOverflow: log.scrollWidth <= log.clientWidth + 1,
+      overlaps,
+      childOverflow,
+      docOverflow: document.documentElement.scrollWidth - window.innerWidth,
+    };
+  })()`);
+  check(
+    cssContainment.panelFitsRightCol && cssContainment.logNoHorizOverflow && cssContainment.overlaps === 0 && cssContainment.childOverflow === 0 && cssContainment.docOverflow <= 0,
+    `AI Gameplay dialog contains long multi-turn thoughts and pasted hints without CSS overflow (${JSON.stringify(cssContainment)})`,
+  );
   const aiX1 = await peek(0xc400);
   const aiY1 = await peek(0xc401);
   check(aiX1 !== aiX0 || aiY1 !== aiY0, `AI Autoplay moved the character ((${aiX0},${aiY0}) -> (${aiX1},${aiY1}))`);

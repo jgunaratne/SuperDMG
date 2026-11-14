@@ -9,11 +9,14 @@ sprites a game has in video memory.
 - **Explore**: see every tile in video RAM as the game runs, hover or click anything
   (a tile, a map cell, a sprite, a pixel on the game screen) to inspect it, and see
   where a tile is used on screen. You can also read the cartridge ROM itself as tiles.
-- **Advanced Tile Mode**: pre-scans uncompressed 2bpp tiles across the entire Cartridge
-  ROM plus active VRAM, colorizes the live screen and whole-game tile sheets in parallel
-  via the Gemini Image API (`gemini-2.5-flash-image`), and locks every pixel's exact 8×8
-  Game Boy position and hardware-palette lightness (plus live Explorer previews for VRAM,
-  Cartridge ROM, Tilemaps and Sprites).
+- **Advanced Tile Mode**: colorizes the **current screen** first via the Gemini Image API
+  (`gemini-2.5-flash-image`), then uses that colorized screen as the visual reference to
+  pre-colorize and cache uncompressed sprites and background tiles across the **entire
+  Cartridge ROM** + active VRAM beforehand. Automatically regenerates colors whenever
+  screen/VRAM tiles change, locks moving character palettes across walking/turning frames
+  so sprites never shift colors mid-step, and saves a persistent **AI Tile History Vault**
+  (`.cache/hd-tiles/` + IndexedDB) so cached versions are reused immediately and selectable
+  in the Tile Explorer inspector.
 - **MIDI Instruments & Harmonic Score Arranger**: check **MIDI instruments** on or off in
   **Sound** (or press `I`) to replace the standard Game Boy pulse, wavetable and LFSR
   noise tones with a 28-sample multi-zone studio bank generated via ElevenLabs, paired
@@ -21,9 +24,10 @@ sprites a game has in video memory.
   chord progression to weave voice-led string/horn pads, flute/oboe/violin 3rd & 6th
   counter-harmonies, space-aware guitar/piano/vibes chord arpeggios, and sub-octave
   upright/cello bass with strict vertical consonance.
-- **AI Autoplay**: check **AI Autoplay** (or press `G`) to let Gemini 4 Hydrogen
-  (`gemini-4-hydrogen`) watch the live Game Boy screen + sprite/tile telemetry, decide
-  what to do next, and steer the character automatically in a closed loop.
+- **AI Autoplay**: check **AI Autoplay** (or press `G`) in the right-hand **AI Gameplay**
+  panel to let Gemini 4 Hydrogen (`gemini-4-hydrogen`) watch the live Game Boy screen +
+  sprite/tile telemetry, inspect its turn-by-turn thinking history, and type or paste
+  hints/walkthrough notes to steer the AI in real time.
 - **Engine**: plain HTML5 canvas and ES modules. No build step and no dependencies.
 
 ## Run

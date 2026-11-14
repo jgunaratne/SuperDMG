@@ -7,7 +7,8 @@ const SAVE_PREFIX = 'gameboy.save.';
 const DB_NAME = 'gameboy';
 const STORE = 'roms';
 const HD_STORE = 'hdtiles';
-const HD_SCHEMA = 'v4';
+const HD_SCHEMA = 'v5';
+const LEGACY_HD_SCHEMA = 'v4';
 
 export function loadSettings(defaults) {
   try {
@@ -134,11 +135,12 @@ export async function storeHdPack(cartId, style, record) {
 export async function recallHdPack(cartId, style) {
   try {
     const db = await openDb();
-    const record = await new Promise((resolve, reject) => {
-      const request = db.transaction(HD_STORE).objectStore(HD_STORE).get(`${HD_SCHEMA}:${cartId}.${style}`);
+    const getKey = (schema) => new Promise((resolve, reject) => {
+      const request = db.transaction(HD_STORE).objectStore(HD_STORE).get(`${schema}:${cartId}.${style}`);
       request.onsuccess = () => resolve(request.result || null);
       request.onerror = () => reject(request.error);
     });
+    const record = (await getKey(HD_SCHEMA)) || (await getKey(LEGACY_HD_SCHEMA));
     db.close();
     return record;
   } catch {

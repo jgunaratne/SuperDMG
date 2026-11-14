@@ -52,6 +52,7 @@ export class Explorer {
     this.screen = screen;
     this.prefs = prefs;
     this.onPrefsChange = onPrefsChange;
+    this.onHdVariantSelect = null;
     this.colors = new Uint32Array(4);
 
     this.tab = prefs.tab;
@@ -603,6 +604,44 @@ export class Explorer {
     if (hdRgba) {
       this.inspHdImage.data.set(hdRgba);
       this.inspHdCtx.putImageData(this.inspHdImage, 0, 0);
+      const variants = this.hdPack.getTileHistoryVariants
+        ? this.hdPack.getTileHistoryVariants(bytes, isVram ? subject.tile : subject.offset, ppu, !isVram)
+        : [];
+      const histWrap = $('insp-hd-history');
+      if (variants.length > 0) {
+        histWrap.hidden = false;
+        this.setText('insp-hd-hist-label', `Cached AI versions (${variants.length})`);
+        const histKey = variants.map((v) => `${v.nsKey}:${v.index}:${v.active ? 1 : 0}:${v.ts}`).join('|');
+        if (this.cache.hdHist !== histKey) {
+          this.cache.hdHist = histKey;
+          $('insp-hd-variants').replaceChildren(...variants.map((v, i) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = v.active ? 'insp-hd-variant active' : 'insp-hd-variant';
+            btn.title = `Reuse cached AI version #${i + 1}${v.tier ? ` (${v.tier})` : ''}`;
+            const cv = document.createElement('canvas');
+            cv.width = 32;
+            cv.height = 32;
+            const ctx = cv.getContext('2d');
+            const img = ctx.createImageData(32, 32);
+            img.data.set(v.rgba);
+            ctx.putImageData(img, 0, 0);
+            btn.append(cv);
+            btn.addEventListener('click', () => {
+              if (this.hdPack.selectTileHistoryVariant(v.nsKey, v.index)) {
+                this.cache.hdHist = '';
+                this.refresh(true);
+                if (this.onHdVariantSelect) this.onHdVariantSelect();
+              }
+            });
+            return btn;
+          }));
+        }
+      } else {
+        histWrap.hidden = true;
+      }
+    } else {
+      $('insp-hd-history').hidden = true;
     }
     let rows = '';
     for (let r = 0; r < 8; r++) rows += `${hex(bytes[offset + r * 2] ?? 0)} ${hex(bytes[offset + r * 2 + 1] ?? 0)}\n`;

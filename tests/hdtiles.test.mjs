@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { GameBoy } from '../src/core/gameboy.js';
 import {
   HD_SCREEN_W, HD_SCREEN_H, HD_TILE_PX, HD_SCALE,
-  tileFingerprint, hexToTileBytes, exteriorMask, extractRomArtTiles, collectScreenTiles,
+  tileFingerprint, hexToTileBytes, exteriorMask, extractRomArtTiles,
+  extractRomGraphicsCatalog, collectScreenTiles, computeScreenContextSignature,
   shiftTile2bpp, packChroma64, HdTilePack, bytesToBase64,
 } from '../src/core/hdtiles.js';
 import { upgradeScreenTiles, clearDiskCache } from '../tools/tile_upgrader.mjs';
@@ -212,5 +213,110 @@ describe('Advanced Tile Mode (whole-game pixel-locked colorization)', () => {
       for (let px = 0; px < 8; px++) distinct.add(u32[(py * 4) * HD_TILE_PX + (px * 4)]);
     }
     assert.equal(distinct.size, 64, 'preserves all 64 independent 24-bit RGB pixel colors on exact 4x4 blocks');
+  });
+
+  it('scans >1,000 whole-ROM sprites & tiles across multiple banks and groups sprite strips', () => {
+    const bigRom = new Uint8Array(256 * 1024);
+    for (let i = 0; i < 1200; i++) {
+      const off = 0x400 + i * 16;
+      // Clean outlined sprite silhouette with unique interior bit pattern per pose (1200 distinct tiles)
+      bigRom[off + 0] = 0x00; bigRom[off + 1] = 0x00;
+      bigRom[off + 2] = 0x3c; bigRom[off + 3] = 0x3c;
+      bigRom[off + 4] = 0xff; bigRom[off + 5] = 0x81 | ((i & 0x1f) << 1);
+      bigRom[off + 6] = 0xff; bigRom[off + 7] = 0x81 | (((i >> 5) & 0x3f) << 1);
+      bigRom[off + 8] = 0x7e; bigRom[off + 9] = 0x42;
+      bigRom[off + 10] = 0x3c; bigRom[off + 11] = 0x3c;
+      bigRom[off + 12] = 0x24; bigRom[off + 13] = 0x24;
+      bigRom[off + 14] = 0x00; bigRom[off + 15] = 0x00;
+    }
+    const catalog = extractRomGraphicsCatalog(bigRom);
+    assert.ok(catalog.allKeys.length >= 1000, `scans beyond old 512 cap across whole ROM (got ${catalog.allKeys.length})`);
+    assert.ok(catalog.spriteKeys.length >= 1000, 'identifies sprite tiles across ROM upfront');
+    assert.ok(catalog.spriteFamilies.length >= 80, 'groups contiguous sprite poses into character strips');
+  });
+
+  it('locks moving character palette across alternating walking tile frames without color shifts', () => {
+    const gb = new GameBoy();
+    gb.loadRom(DEMO);
+    for (let i = 0; i < 20; i++) gb.runFrame();
+
+    const standTopIdx = gb.ppu.oam[2] & 0xfe;
+    const walkTopIdx = standTopIdx + 2;
+    const standTopKey = tileFingerprint(gb.ppu.vram, standTopIdx * 16);
+    const standBotKey = tileFingerprint(gb.ppu.vram, (standTopIdx + 1) * 16);
+    const walkTopKey = tileFingerprint(gb.ppu.vram, walkTopIdx * 16);
+    const walkBotKey = tileFingerprint(gb.ppu.vram, (walkTopIdx + 1) * 16);
+
+    // Standing pose colored crimson; walking pose initially has mismatched green from a blind sheet!
+    const crimson = new Uint8Array(192);
+    const mismatchedGreen = new Uint8Array(192);
+    for (let i = 0; i < 64; i++) {
+      crimson[i * 3] = 220; crimson[i * 3 + 1] = 55; crimson[i * 3 + 2] = 70;
+      mismatchedGreen[i * 3] = 30; mismatchedGreen[i * 3 + 1] = 210; mismatchedGreen[i * 3 + 2] = 60;
+    }
+
+    const pack = new HdTilePack('snes');
+    pack.ingest({
+      tiles: {
+        [`spr:${standTopKey}`]: { key: standTopKey, role: 'spr', tier: 'scene', pal: gb.ppu.obp0, rgb24Base64: bytesToBase64(crimson) },
+        [`spr:${standBotKey}`]: { key: standBotKey, role: 'spr', tier: 'scene', pal: gb.ppu.obp0, rgb24Base64: bytesToBase64(crimson) },
+        [`spr:${walkTopKey}`]: { key: walkTopKey, role: 'spr', tier: 'rom', pal: gb.ppu.obp0, rgb24Base64: bytesToBase64(mismatchedGreen) },
+        [`spr:${walkBotKey}`]: { key: walkBotKey, role: 'spr', tier: 'rom', pal: gb.ppu.obp0, rgb24Base64: bytesToBase64(mismatchedGreen) },
+      },
+    });
+
+    const out = new Uint32Array(HD_SCREEN_W * HD_SCREEN_H);
+    const fb = new Uint32Array([0xffffffff, 0xffaaaaaa, 0xff555555, 0xff000000]);
+
+    // Render initial standing frame, then hold Right for 16 frames so the game cycles into its walking pose!
+    pack.renderHdFrame(gb.ppu, fb, out);
+    gb.setButton('right', true);
+    for (let f = 0; f < 16; f++) {
+      gb.runFrame();
+      pack.renderHdFrame(gb.ppu, fb, out);
+    }
+    gb.setButton('right', false);
+
+    const walkRec = pack.sprTiles.get(walkBotKey);
+    assert.ok(walkRec, 'walking frame record exists');
+    let redDominantCount = 0;
+    for (let i = 0; i < 64; i++) {
+      if (walkRec.rgb24[i * 3] > walkRec.rgb24[i * 3 + 1]) redDominantCount++;
+    }
+    assert.ok(redDominantCount > 10, 'walking frame locked to standing character crimson palette instead of flashing green');
+  });
+
+  it('saves persistent tile history across regenerations and reuses cached scene contexts', () => {
+    const gb = new GameBoy();
+    gb.loadRom(DEMO);
+    for (let i = 0; i < 15; i++) gb.runFrame();
+
+    const sigA = computeScreenContextSignature(gb.ppu);
+    const key = tileFingerprint(gb.ppu.vram, 2 * 16);
+    const v1 = new Uint8Array(192).fill(90);
+    const v2 = new Uint8Array(192).fill(185);
+
+    const pack = new HdTilePack('snes');
+    pack.ingest({
+      sceneId: sigA.id,
+      shades: ['#e8ecd0', '#88b860', '#407048', '#182420'],
+      tiles: { [`bg:${key}`]: { key, role: 'bg', tier: 'scene', pal: gb.ppu.bgp, rgb24Base64: bytesToBase64(v1) } },
+    });
+    pack.ingest({
+      sceneId: 'other_scene:4',
+      shades: ['#d0d8f0', '#7088c8', '#384888', '#14182c'],
+      tiles: { [`bg:${key}`]: { key, role: 'bg', tier: 'scene', pal: gb.ppu.bgp, rgb24Base64: bytesToBase64(v2) } },
+    });
+
+    const variants = pack.getTileHistoryVariants(gb.ppu.vram, 2, gb.ppu, false);
+    assert.equal(variants.length, 2, 'keeps both original and regenerated AI tile versions in history');
+    assert.equal(variants[1].active, true, 'latest version is active');
+
+    assert.equal(pack.selectTileHistoryVariant(`bg:${key}`, 0), true);
+    assert.equal(pack.bgTiles.get(key).rgb24[0], 90, 'selecting historical variant #1 restores its exact pixels');
+
+    // Returning to screen sigA restores sigA's cached theme and tile colors immediately
+    assert.equal(pack.restoreCachedSceneIfAvailable(sigA), true);
+    assert.deepEqual(pack.themeColors[0], [0xe8, 0xec, 0xd0]);
   });
 });
