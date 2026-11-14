@@ -18,6 +18,18 @@ rNR11  equ $FF11
 rNR12  equ $FF12
 rNR13  equ $FF13
 rNR14  equ $FF14
+rNR21  equ $FF16
+rNR22  equ $FF17
+rNR23  equ $FF18
+rNR24  equ $FF19
+rNR30  equ $FF1A
+rNR32  equ $FF1C
+rNR33  equ $FF1D
+rNR34  equ $FF1E
+rNR41  equ $FF20
+rNR42  equ $FF21
+rNR43  equ $FF22
+rNR44  equ $FF23
 rNR50  equ $FF24
 rNR51  equ $FF25
 rNR52  equ $FF26
@@ -56,6 +68,8 @@ dirty       equ $C408        ; a map cell changed and must be redrawn...
 dirty_lo    equ $C409        ; ...at this video RAM address
 dirty_hi    equ $C40A
 vblank_flag equ $C40B
+music_tick  equ $C40C        ; counts frames 0..7 per eighth-note step
+music_step  equ $C40D        ; 0..127 across the 16-bar pastoral score
 
 ; --- Interrupt vectors and header ------------------------------------------------------
 
@@ -137,6 +151,7 @@ start:
   ldh (rNR51),a
   ld a,$77
   ldh (rNR50),a
+  call init_music
 
   ld a,START_X
   ld (player_x),a
@@ -163,6 +178,7 @@ main:
   call draw                  ; first, while video memory is still writable
   call read_keys
   call update
+  call update_music
   jr main
 
 ; --- Drawing (runs in VBlank) ----------------------------------------------------------

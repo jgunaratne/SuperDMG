@@ -8,6 +8,9 @@ import { upgraderStatus, upgradeScreenTiles, clearDiskCache } from './tools/tile
 import { aiPlayerStatus, planNextMoves } from './tools/ai_player.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+try {
+  process.loadEnvFile?.(path.join(ROOT, '.env'));
+} catch { /* optional .env */ }
 const PORT = Number(process.env.PORT || 8740);
 const HOST = process.env.HOST || '0.0.0.0';
 const TYPES = {

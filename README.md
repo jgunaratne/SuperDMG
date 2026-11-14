@@ -14,14 +14,15 @@ sprites a game has in video memory.
   via the Gemini Image API (`gemini-2.5-flash-image`), and locks every pixel's exact 8×8
   Game Boy position and hardware-palette lightness (plus live Explorer previews for VRAM,
   Cartridge ROM, Tilemaps and Sprites).
-- **MIDI Instruments**: check **MIDI instruments** on or off in **Sound**
-  (or press `I`) to replace the standard Game Boy pulse, wavetable and LFSR noise tones
-  with a 28-sample multi-zone studio bank generated via ElevenLabs (concert grand piano,
-  bowed violin/strings, concert flute, oboe, French horn, nylon guitar, Rhodes electric
-  piano, vibraphone, celesta, upright/cello bass and close-mic acoustic drum kit) with
-  Hermite cubic pitch resampling, phase-locked sustain loops and concert-hall reverb.
-- **AI Autoplay**: check **AI Autoplay** (or press `G`) to let Gemini
-  (`gemini-2.5-flash`) watch the live Game Boy screen + sprite/tile telemetry, decide
+- **MIDI Instruments & Harmonic Score Arranger**: check **MIDI instruments** on or off in
+  **Sound** (or press `I`) to replace the standard Game Boy pulse, wavetable and LFSR
+  noise tones with a 28-sample multi-zone studio bank generated via ElevenLabs, paired
+  with a real-time music-theory arranger (`arranger.js`) that infers the live key and
+  chord progression to weave voice-led string/horn pads, flute/oboe/violin 3rd & 6th
+  counter-harmonies, space-aware guitar/piano/vibes chord arpeggios, and sub-octave
+  upright/cello bass with strict vertical consonance.
+- **AI Autoplay**: check **AI Autoplay** (or press `G`) to let Gemini 3.8 Flash
+  (`gemini-3.8-flash`) watch the live Game Boy screen + sprite/tile telemetry, decide
   what to do next, and steer the character automatically in a closed loop.
 - **Engine**: plain HTML5 canvas and ES modules. No build step and no dependencies.
 

@@ -243,6 +243,206 @@ const text = (s) => [...s].map(fontTile);
 
 const DATA_START = 0x400;
 
+// --- 16-Bar Pastoral Score ("Gem Garden" in G Major / E Minor, 112 BPM) --------------
+
+const NOTE_SEMITONES = {
+  C: 0, 'C#': 1, Db: 1, D: 2, 'D#': 3, Eb: 3, E: 4, F: 5,
+  'F#': 6, Gb: 6, G: 7, 'G#': 8, Ab: 8, A: 9, 'A#': 10, Bb: 10, B: 11,
+};
+
+function noteHz(spec) {
+  const m = /^([A-G](?:#|b)?)(\d)$/.exec(spec);
+  if (!m) throw new Error(`bad note "${spec}"`);
+  const midi = (Number(m[2]) + 1) * 12 + NOTE_SEMITONES[m[1]];
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+/** Encodes a 128-step eighth-note table as [lo, hi] pairs ($00 = hold, $FE = rest). */
+function encodeTrack(phrases, { wave = false } = {}) {
+  const steps = [];
+  for (const token of phrases.trim().split(/\s+/)) {
+    const [note, lenStr] = token.split(':');
+    const len = Number(lenStr);
+    if (!len || len < 1) throw new Error(`bad token "${token}"`);
+    if (note === 'R') {
+      steps.push(0x00, 0xfe);
+      for (let i = 1; i < len; i++) steps.push(0x00, 0x00);
+    } else {
+      const hz = noteHz(note);
+      const divider = Math.max(0, Math.min(2047, Math.round(2048 - (wave ? 65536 : 131072) / hz)));
+      steps.push(divider & 0xff, 0x80 | ((divider >> 8) & 0x07));
+      for (let i = 1; i < len; i++) steps.push(0x00, 0x00);
+    }
+  }
+  if (steps.length !== 256) {
+    throw new Error(`expected 128 eighth-note steps (256 bytes), got ${steps.length / 2}`);
+  }
+  return steps;
+}
+
+// Section A (bars 1-8): sunlit G-major stroll; Section B (bars 9-16): pond & trees bridge.
+const MELODY_SCORE = `
+  D5:2 G5:2 B5:3 A5:1   F#5:3 E5:1 D5:4   E5:2 G5:2 D5:3 B4:1   C5:2 E5:2 D5:1 F#5:3
+  G5:2 B5:2 D6:3 B5:1   B5:2 G5:2 F#5:4   E5:2 G5:2 A5:2 F#5:2  G5:6 R:2
+  E5:3 F#5:1 G5:4       G5:2 E5:2 C5:4    C5:2 E5:2 F#5:3 A5:1  B5:4 A5:4
+  G5:2 B5:2 A5:3 F#5:1  G5:2 E5:2 D5:4    C5:2 E5:2 G5:4        F#5:2 A5:2 D5:3 R:1
+`;
+
+const BASS_SCORE = `
+  G3:4 D3:4   F#3:4 B2:4   C3:4 B2:4   A2:4 D3:4
+  G3:4 D3:4   E3:4 B2:4    C3:4 D3:4   G2:6 D3:2
+  E3:4 B2:4   C3:4 G2:4    A2:4 D3:4   G3:4 F#3:4
+  E3:4 D3:4   C3:4 B2:4    A2:4 C3:4   D3:4 F#3:4
+`;
+
+// Warm rounded-cello 32-nibble waveform for Channel 3 ($FF30-$FF3F).
+const WAVE_RAM_BYTES = [
+  0x24, 0x69, 0xbd, 0xef, 0xfe, 0xdb, 0x96, 0x42,
+  0x12, 0x35, 0x79, 0xbc, 0xcb, 0x97, 0x53, 0x21,
+];
+
+const MUSIC_DRIVER_ASM = `
+; --- Pastoral music player (CH2 melody, CH3 wave bass, CH4 brush; CH1 kept for SFX) ---
+
+init_music:
+  xor a
+  ldh (rNR30),a
+  ld hl,wave_table
+  ld c,$30
+  ld b,16
+.wloop:
+  ld a,(hl+)
+  ld ($FF00+c),a
+  inc c
+  dec b
+  jr nz,.wloop
+  ld a,$80
+  ldh (rNR30),a
+  ld a,7
+  ld (music_tick),a
+  ld a,$FF
+  ld (music_step),a
+  ret
+
+update_music:
+  ld a,(music_tick)
+  inc a
+  cp 8
+  jr nc,.step
+  ld (music_tick),a
+  ret
+.step:
+  xor a
+  ld (music_tick),a
+  ld a,(music_step)
+  inc a
+  and 127
+  ld (music_step),a
+  ld e,a
+
+  ; --- Channel 2: Lead melody (50% duty in bars 1-8, 25% duty in bars 9-16) -----------
+  ld l,e
+  ld h,0
+  add hl,hl
+  ld bc,melody_table
+  add hl,bc
+  ld a,(hl+)
+  ld d,a
+  ld a,(hl)
+  or a
+  jr z,.bass                 ; $00 = sustain current note
+  cp $FE
+  jr nz,.play_mel
+  xor a
+  ldh (rNR22),a
+  jr .bass
+.play_mel:
+  ld b,a
+  ld a,e
+  bit 6,a
+  ld a,$80
+  jr z,.duty_set
+  ld a,$40
+.duty_set:
+  ldh (rNR21),a
+  ld a,$A4
+  ldh (rNR22),a
+  ld a,d
+  ldh (rNR23),a
+  ld a,b
+  ldh (rNR24),a
+
+  ; --- Channel 3: Walking wave bass ---------------------------------------------------
+.bass:
+  ld l,e
+  ld h,0
+  add hl,hl
+  ld bc,bass_table
+  add hl,bc
+  ld a,(hl+)
+  ld d,a
+  ld a,(hl)
+  or a
+  jr z,.drums
+  cp $FE
+  jr nz,.play_bass
+  xor a
+  ldh (rNR32),a
+  jr .drums
+.play_bass:
+  ld b,a
+  ld a,$80
+  ldh (rNR30),a
+  ld a,$40
+  ldh (rNR32),a
+  ld a,d
+  ldh (rNR33),a
+  ld a,b
+  ldh (rNR34),a
+
+  ; --- Channel 4: Light pastoral percussion (kick on 1, brush snare on 3, hat on 2/4) -
+.drums:
+  ld a,e
+  and 7
+  jr z,.kick
+  cp 4
+  jr z,.snare
+  cp 2
+  jr z,.hat
+  cp 6
+  ret nz
+.hat:
+  ld a,$36
+  ldh (rNR41),a
+  ld a,$31
+  ldh (rNR42),a
+  ld a,$11
+  ldh (rNR43),a
+  ld a,$C0
+  ldh (rNR44),a
+  ret
+.kick:
+  ld a,$24
+  ldh (rNR41),a
+  ld a,$51
+  ldh (rNR42),a
+  ld a,$83
+  ldh (rNR43),a
+  ld a,$C0
+  ldh (rNR44),a
+  ret
+.snare:
+  ld a,$2A
+  ldh (rNR41),a
+  ld a,$41
+  ldh (rNR42),a
+  ld a,$42
+  ldh (rNR43),a
+  ld a,$C0
+  ldh (rNR44),a
+  ret
+`;
+
 /** Assembles the demo. @return {{bytes: Uint8Array, summary: string}} */
 export function buildDemo() {
   const level = readLevel();
@@ -265,6 +465,10 @@ export function buildDemo() {
     db('level', level.cells),
     db('hud_text', text(`GEMS 00/${String(total).padStart(2, '0')}`)),
     db('win_text', text('YOU WIN!')),
+    MUSIC_DRIVER_ASM,
+    db('wave_table', WAVE_RAM_BYTES),
+    db('melody_table', encodeTrack(MELODY_SCORE, { wave: false })),
+    db('bass_table', encodeTrack(BASS_SCORE, { wave: true })),
   ].join('\n');
 
   const { bytes, end, symbols } = assemble(source);

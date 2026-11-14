@@ -2,7 +2,7 @@
 //
 // Renders the live 160x144 Game Boy screen at 4x (640x576) inside a labeled 20x18
 // tile-coordinate ruler frame (672x608), pairs it with hardware sprite/scroll telemetry
-// and recent turn outcomes, and asks Gemini (`GEMINI_MODEL`, default `gemini-2.5-flash`)
+// and recent turn outcomes, and asks Gemini (`GEMINI_MODEL`, default `gemini-3.8-flash`)
 // to decide what to do next and return a frame-accurate joypad action sequence.
 
 import fs from 'node:fs';
@@ -14,7 +14,7 @@ import { encodePng, decodePng } from './png.mjs';
 import { base64ToBytes } from '../src/core/hdtiles.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const DEFAULT_AI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+export const DEFAULT_AI_MODEL = 'gemini-3.8-flash';
 
 const SCREEN_W = 160;
 const SCREEN_H = 144;
@@ -76,9 +76,13 @@ function loadGeminiApiKey() {
   return '';
 }
 
+function resolveAiModel() {
+  return (process.env.GEMINI_MODEL || DEFAULT_AI_MODEL).trim().replace(/^models\//, '');
+}
+
 export function aiPlayerStatus() {
   const mode = process.env.AI_PLAYER_BACKEND || '';
-  const model = process.env.GEMINI_MODEL || DEFAULT_AI_MODEL;
+  const model = resolveAiModel();
   if (mode === 'heuristic') {
     return {
       available: true,
@@ -464,12 +468,6 @@ function runHeuristicPlanner(payload) {
   });
 }
 
-const BUDGET_BY_LEVEL = {
-  LOW: 0,
-  MEDIUM: 1024,
-  HIGH: 4096,
-};
-
 async function callGeminiPlanner({ imagePath, prompt, effortLevel }) {
   const apiKey = loadGeminiApiKey();
   if (!apiKey) {
@@ -477,10 +475,8 @@ async function callGeminiPlanner({ imagePath, prompt, effortLevel }) {
   }
 
   const b64 = fs.readFileSync(imagePath).toString('base64');
-  const model = process.env.GEMINI_MODEL || DEFAULT_AI_MODEL;
-  const thinkingConfig = model.startsWith('gemini-2.5')
-    ? { thinkingBudget: BUDGET_BY_LEVEL[effortLevel] ?? 0, includeThoughts: false }
-    : { thinkingLevel: effortLevel, includeThoughts: false };
+  const model = resolveAiModel();
+  const thinkingConfig = { thinkingLevel: effortLevel, includeThoughts: false };
 
   const resp = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
@@ -518,7 +514,7 @@ async function callGeminiPlanner({ imagePath, prompt, effortLevel }) {
 export async function planNextMoves(payload = {}) {
   const tStart = Date.now();
   const effortSpec = AI_EFFORTS.find((e) => e.id === payload.effort) || AI_EFFORTS[0];
-  const configuredModel = process.env.GEMINI_MODEL || DEFAULT_AI_MODEL;
+  const configuredModel = resolveAiModel();
 
   if (process.env.AI_PLAYER_BACKEND === 'heuristic') {
     const plan = runHeuristicPlanner(payload);

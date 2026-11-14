@@ -7,6 +7,8 @@
 // Falls back seamlessly to 5-band anti-aliased acoustic wavetables before the sample
 // bank finishes decoding or in headless environments that do not load audio assets.
 
+import { HarmonicArranger } from './arranger.js';
+
 const NOISE_DIVISOR = [8, 16, 32, 48, 64, 80, 96, 112];
 const WAVE_VOLUME = [0, 1.0, 0.5, 0.25];
 
@@ -397,8 +399,8 @@ function getPatches() {
   return compiledPatches;
 }
 
-const MAX_VOICES = 20;
-const MAX_DRUMS = 10;
+const MAX_VOICES = 32;
+const MAX_DRUMS = 12;
 
 const COMB_TIMES_L = [0.0297, 0.0371, 0.0411, 0.0437];
 const COMB_STEREO_SPREAD = 0.00052;
@@ -410,6 +412,8 @@ function makeVoice() {
     active: false,
     releasing: false,
     channel: 0,
+    isArranger: false,
+    customAttack: 0,
     patch: null,
     sampleZone: null,
     samplePos: 0,
@@ -473,6 +477,8 @@ export class MidiSynth {
 
     this.voices = Array.from({ length: MAX_VOICES }, makeVoice);
     this.channelVoice = [null, null, null, null];
+    this.arranger = new HarmonicArranger();
+    this.arrangerEnabled = true;
 
     this.drums = Array.from({ length: MAX_DRUMS }, makeDrum);
     this.noiseSustainGain = 0;
@@ -552,6 +558,13 @@ export class MidiSynth {
     if (PRESET_ORCHESTRATION[id]) this.preset = id;
   }
 
+  setArrangerEnabled(enabled) {
+    const next = Boolean(enabled);
+    if (next === this.arrangerEnabled) return;
+    this.arrangerEnabled = next;
+    if (!next) this.arranger.reset(this);
+  }
+
   setSampleRate(rate) {
     if (rate <= 0) {
       this.sampleRate = 0;
@@ -589,6 +602,7 @@ export class MidiSynth {
   }
 
   reset() {
+    this.arranger.reset(null);
     for (const v of this.voices) { v.active = false; v.releasing = false; }
     this.channelVoice[1] = null;
     this.channelVoice[2] = null;
@@ -760,7 +774,9 @@ export class MidiSynth {
     let victim = this.voices[0];
     let bestScore = Infinity;
     for (const v of this.voices) {
-      const score = (v.releasing ? 0 : 10) + v.currentGain;
+      // Never steal an active non-releasing Game Boy channel if any releasing or arranger voice exists.
+      const base = v.releasing ? 0 : (v.isArranger ? 5 : 25);
+      const score = base + v.currentGain;
       if (score < bestScore) {
         bestScore = score;
         victim = v;
@@ -770,6 +786,75 @@ export class MidiSynth {
       if (this.channelVoice[ch] === victim) this.channelVoice[ch] = null;
     }
     return victim;
+  }
+
+  /** Spawns a polyphonic accompaniment voice managed by `HarmonicArranger`. */
+  spawnArrangerVoice(patchId, freq, gain, panL, panR) {
+    if (freq < 27 || freq > 4200 || gain <= 0.005) return null;
+    const patch = this.patches[patchId] || this.patches.violin_ensemble;
+    const zone = this.pickSampleZone(patch.id, freq);
+    const v = this.allocVoice();
+    v.active = true;
+    v.releasing = false;
+    v.channel = 0;
+    v.isArranger = true;
+    // Sustaining pads/counter-melodies swell gently (24 ms); plucked arps stay crisp (3 ms).
+    const plucked = patchId === 'nylon_guitar' || patchId === 'grand_piano' ||
+        patchId === 'vibraphone_celesta' || patchId === 'acoustic_bass';
+    v.customAttack = plucked ? 0.003 : 0.024;
+    v.patch = patch;
+    v.sampleZone = zone;
+    v.samplePos = 0;
+    v.samplePos2 = zone && zone.loop ? zone.loopStart + zone.loopSpan * 0.41 : 0;
+    v.freq = freq;
+    v.phase1 = (this.whiteNoise() * 0.5 + 0.5) * 0.25;
+    v.phase2 = (v.phase1 + 0.37) % 1;
+    v.phase3 = (v.phase1 + 0.71) % 1;
+    v.tinePhase = 0;
+    v.vibPhase = 0;
+    v.age = 0;
+    v.releaseAge = 0;
+    v.envSmooth = gain;
+    v.currentGain = 0;
+    v.velocity = Math.max(0.22, Math.min(0.75, gain * 1.65));
+    v.panL = panL;
+    v.panR = panR;
+    v.chiffState = 0;
+    v.lpL = 0;
+    v.lpR = 0;
+    return v;
+  }
+
+  /** Spawns a soft off-beat closed hi-hat brush tick for rhythmic drum grooves. */
+  spawnGhostHat(apu, velocity) {
+    let slot = null;
+    for (const d of this.drums) {
+      if (!d.active) { slot = d; break; }
+    }
+    if (!slot) return;
+    const [panL, panR] = this.channelPan(apu.nr51, 4);
+    if (panL === 0 && panR === 0) return;
+    const sampleZone = this.sampleDrums.closed_hat || null;
+    const playbackRate = 1.04 + this.whiteNoise() * 0.02;
+    slot.active = true;
+    slot.kind = 'closed_hat';
+    slot.sampleZone = sampleZone;
+    slot.samplePos = 0;
+    slot.playbackRate = playbackRate;
+    slot.choked = false;
+    slot.age = 0;
+    slot.duration = sampleZone
+      ? Math.min(0.095, sampleZone.pcm.length / (sampleZone.sampleRate * playbackRate))
+      : 0.055;
+    slot.velocity = velocity;
+    slot.baseFreq = 120;
+    slot.phase1 = 0;
+    slot.phase2 = 0;
+    slot.cymbalPhases.fill(0);
+    slot.filterLp = 0;
+    slot.panL = Math.max(0, Math.min(1, panL - 0.12));
+    slot.panR = Math.max(0, Math.min(1, panR + 0.12));
+    slot.reverbSend = 0.10;
   }
 
   noteOn(apu, channel) {
@@ -800,6 +885,8 @@ export class MidiSynth {
     v.active = true;
     v.releasing = false;
     v.channel = channel;
+    v.isArranger = false;
+    v.customAttack = 0;
     v.patch = patch;
     v.sampleZone = zone;
     v.samplePos = 0;
@@ -914,6 +1001,7 @@ export class MidiSynth {
     slot.panL = Math.max(0, Math.min(1, panL - kitBias));
     slot.panR = Math.max(0, Math.min(1, panR + kitBias));
     slot.reverbSend = reverbSend;
+    if (this.arrangerEnabled) this.arranger.onDrumTrigger();
   }
 
   /** Synthesizes one stereo output frame [left, right] at `this.sampleRate`. */
@@ -964,6 +1052,10 @@ export class MidiSynth {
       }
     }
 
+    if (this.arrangerEnabled) {
+      this.arranger.step(dt, apu, this);
+    }
+
     let dryL = 0, dryR = 0;
     let revSendL = 0, revSendR = 0;
 
@@ -987,11 +1079,13 @@ export class MidiSynth {
         amp = v.releaseStartGain * r * r;
       } else if (zone) {
         // Real ElevenLabs recordings already carry their own natural acoustic decay.
-        const atk = v.age < patch.sampleAttack ? v.age / patch.sampleAttack : 1;
+        const atkDur = v.customAttack || patch.sampleAttack;
+        const atk = v.age < atkDur ? v.age / atkDur : 1;
         amp = v.envSmooth * atk * patch.sampleGain;
         v.currentGain = amp;
       } else {
-        const attack = v.age < patch.attackTime ? v.age / patch.attackTime : 1;
+        const atkDur = v.customAttack || patch.attackTime;
+        const attack = v.age < atkDur ? v.age / atkDur : 1;
         let acousticSustain = 1;
         if (patch.naturalDecay > 0) {
           acousticSustain = patch.sustainFloor +

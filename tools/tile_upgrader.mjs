@@ -516,6 +516,9 @@ export async function upgradeScreenTiles(payload) {
   // Procedural fast path for hermetic unit tests
   if (process.env.HD_TILE_BACKEND === 'procedural') {
     const outTiles = { ...cachedTiles };
+    const baseShades = [0, 1, 2, 3].map((s) => oklabToRgb(curve.L[s], 0.02, 0.04));
+    const baseHud = [0, 1, 2, 3].map((s) => oklabToRgb(curve.L[s], -0.01, -0.02));
+    const winSet = new Set(gridCells.filter((c) => c.isWin).map((c) => c.key));
     const allKeys = new Set([
       ...gridCells.map((c) => c.key),
       ...extraSheetKeys,
@@ -526,15 +529,21 @@ export async function upgradeScreenTiles(payload) {
       const raw = decodeTile(hexToTileBytes(key), 0);
       const st = tileStats(raw);
       if (st.unique <= 1 || isGlyphTile(raw, st)) continue;
+      const isWin = winSet.has(key);
+      const ext = exteriorMask(raw, 0);
       const angle = ((idx++ * 137.5) * Math.PI) / 180;
       const rgb24 = new Uint8Array(192);
       for (let i = 0; i < 64; i++) {
         const sh = (bgp >> (raw[i] * 2)) & 3;
-        const [r, g, b] = oklabToRgb(curve.L[sh], Math.cos(angle) * 0.11, Math.sin(angle) * 0.11);
+        const [r, g, b] = isWin
+          ? baseHud[sh]
+          : ext[i]
+            ? baseShades[bgp & 3]
+            : oklabToRgb(curve.L[sh], Math.cos(angle) * 0.11, Math.sin(angle) * 0.11);
         rgb24[i * 3] = r; rgb24[i * 3 + 1] = g; rgb24[i * 3 + 2] = b;
       }
-      const role = st.borderZero < 10 ? 'surface' : 'bg';
-      outTiles[`bg:${key}`] = { key, role, tier: 'scene', pal: bgp, rgb24Base64: bytesToBase64(rgb24) };
+      const role = isWin ? 'win' : (st.borderZero < 10 ? 'surface' : 'bg');
+      outTiles[`${isWin ? 'win' : 'bg'}:${key}`] = { key, role, tier: 'scene', pal: bgp, rgb24Base64: bytesToBase64(rgb24) };
     }
     for (const cl of spriteClusters) {
       for (const m of cl.members) {

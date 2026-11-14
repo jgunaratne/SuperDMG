@@ -1,9 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { GameBoy } from '../src/core/gameboy.js';
 import { bytesToBase64 } from '../src/core/hdtiles.js';
 import { decodePng } from '../tools/png.mjs';
 import {
+  DEFAULT_AI_MODEL,
   aiPlayerStatus,
   renderAnnotatedScreenPng,
   normalizeActionPlan,
@@ -15,6 +19,30 @@ import {
   summarizeTurnOutcome,
 } from '../src/ui/autoplayer.js';
 import { demoRom } from './helpers.mjs';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const DEPRECATED_AI_MODELS = ['gemini-2.5-flash', 'gemini-3.6-flash'];
+const SUPPORTED_AI_MODELS = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash'];
+
+test('active AI autoplay model is gemini-3.8-flash and retired model IDs do not appear', () => {
+  assert.equal(DEFAULT_AI_MODEL, 'gemini-3.8-flash');
+  assert.ok(SUPPORTED_AI_MODELS.includes(DEFAULT_AI_MODEL));
+  const prevModel = process.env.GEMINI_MODEL;
+  delete process.env.GEMINI_MODEL;
+  try {
+    const status = aiPlayerStatus();
+    assert.ok(status.model.startsWith('gemini-3.8-flash'), `unexpected status model: ${status.model}`);
+  } finally {
+    if (prevModel !== undefined) process.env.GEMINI_MODEL = prevModel;
+  }
+  for (const rel of ['tools/ai_player.mjs', 'src/ui/autoplayer.js', 'server.mjs', 'README.md']) {
+    const src = fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    for (const retired of DEPRECATED_AI_MODELS) {
+      const re = new RegExp(`\\b${retired.replace(/\./g, '\\.')}\\b(?![-a-z])`);
+      assert.equal(re.test(src), false, `${rel} must not reference retired model ${retired}`);
+    }
+  }
+});
 
 function bootDemo() {
   const gb = new GameBoy();

@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { GameBoy } from '../src/core/gameboy.js';
 import { MIDI_PRESETS } from '../src/core/midi.js';
+import { isConsonantWithGame, midiFromHz } from '../src/core/arranger.js';
 import { machine, demoRom } from './helpers.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -179,9 +180,8 @@ test('Channel 4 synthesizes distinct kick and hi-hat percussion with open-hat ch
 });
 
 test('toggling MIDI mode on/off mid-note and switching all presets is seamless, and boot reset is silent', () => {
-  const gb = new GameBoy();
+  const gb = idle();
   gb.apu.setMidiEnabled(true);
-  gb.loadRom(demoRom());
   const bootQuiet = recordStereo(gb, 0.15);
   assert.ok(rms(bootQuiet.left) < 1e-4, 'post-boot state with ch1.volume=0 does not play a phantom note');
 
@@ -263,4 +263,86 @@ test('ElevenLabs studio sample bank loads all 28 zones, plays pitch-locked notes
     maxStep = Math.max(maxStep, Math.abs(strings.left[i] - strings.left[i - 1]));
   }
   assert.ok(maxStep < 0.25, `no discontinuity click across sustain loop wrap (maxStep=${maxStep.toFixed(4)})`);
+});
+
+test('HarmonicArranger enriches the Gem Garden score with multi-part accompaniment and 0 dissonant clashes', () => {
+  // 1. Compare polyphonic voice richness with arranger off vs on across the demo score.
+  const gbPlain = new GameBoy();
+  gbPlain.loadRom(demoRom());
+  gbPlain.apu.setMidiEnabled(true);
+  gbPlain.apu.midi.setArrangerEnabled(false);
+  gbPlain.apu.setSampleRate(48000);
+
+  const gbRich = new GameBoy();
+  gbRich.loadRom(demoRom());
+  gbRich.apu.setMidiEnabled(true);
+  gbRich.apu.midi.setArrangerEnabled(true);
+  gbRich.apu.setSampleRate(48000);
+
+  let maxPlainVoices = 0;
+  let maxRichVoices = 0;
+  let arrangerFrames = 0;
+  let arpTriggers = 0;
+  let clashes = 0;
+  let checkedFrames = 0;
+
+  // Step through a full 16-bar cycle (~1,040 frames) of Gem Garden's pastoral score.
+  for (let frame = 0; frame < 1040; frame++) {
+    gbPlain.runFrame();
+    gbPlain.apu.sampleCount = 0;
+    gbRich.runFrame();
+    gbRich.apu.sampleCount = 0;
+
+    const plainSustaining = gbPlain.apu.midi.voices.filter((v) => v.active && !v.releasing).length;
+    const richSustaining = gbRich.apu.midi.voices.filter((v) => v.active && !v.releasing).length;
+    if (plainSustaining > maxPlainVoices) maxPlainVoices = plainSustaining;
+    if (richSustaining > maxRichVoices) maxRichVoices = richSustaining;
+
+    const midi = gbRich.apu.midi;
+    const arr = midi.arranger;
+    const activeArrVoices = midi.voices.filter((v) => v.active && !v.releasing && v.isArranger);
+    if (activeArrVoices.length > 0) arrangerFrames++;
+    if (arr.arpStep > arpTriggers) arpTriggers = arr.arpStep;
+
+    // Collect live Game Boy pitches and verify every active non-releasing arranger slot
+    // satisfies strict music-theory consonance against all sounding game channels.
+    const gameMidis = [];
+    let bassMidi = null;
+    for (let ch = 1; ch <= 3; ch++) {
+      if (ch === 1 && gbRich.apu.ch1.sweepEnabled && gbRich.apu.ch1.sweepPeriod > 0 && gbRich.apu.ch1.sweepShift > 0) continue;
+      const g = midi.channelEnvelopeGain(gbRich.apu, ch);
+      if (g <= 0.02) continue;
+      const hz = midi.channelFrequency(gbRich.apu, ch);
+      if (hz < 27 || hz > 4186) continue;
+      const m = midiFromHz(hz);
+      gameMidis.push(m);
+      if (m < 63 && (bassMidi === null || ch === 3 || m < bassMidi)) bassMidi = m;
+    }
+
+    if (gameMidis.length > 0) {
+      checkedFrames++;
+      for (let s = 0; s < arr.slotVoices.length; s++) {
+        const sv = arr.slotVoices[s];
+        if (sv && sv.active && !sv.releasing && arr.slotMidi[s] > 0) {
+          if (!isConsonantWithGame(arr.slotMidi[s], gameMidis, bassMidi)) {
+            clashes++;
+          }
+        }
+      }
+    }
+  }
+
+  assert.ok(maxRichVoices >= maxPlainVoices + 2,
+    `HarmonicArranger adds polyphonic orchestral voices (max ${maxRichVoices} vs plain ${maxPlainVoices})`);
+  assert.ok(arrangerFrames > 600, `accompaniment voices active across the score (${arrangerFrames} frames)`);
+  assert.ok(arpTriggers >= 6, `space-aware counter-arpeggiator blooms during held notes (${arpTriggers} steps)`);
+  assert.ok(checkedFrames > 800 && clashes === 0,
+    `zero dissonant clashes across ${checkedFrames} frames (clashes=${clashes})`);
+
+  // Key detector locks onto G major (7) or relative E minor (4) for Gem Garden's score.
+  const { keyRoot, keyMinor } = gbRich.apu.midi.arranger;
+  assert.ok(
+    (keyRoot === 7 && !keyMinor) || (keyRoot === 4 && keyMinor),
+    `detected G major / E minor tonal center (got root=${keyRoot}, minor=${keyMinor})`,
+  );
 });

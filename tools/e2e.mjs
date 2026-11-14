@@ -327,6 +327,8 @@ try {
   await page.sleep(350);
   const midiPeak = await page.eval('Math.max(0, ...window.__sound.map((b) => b[2]))');
   check(midiPeak > 0.02, `MIDI synthesizer schedules audible instrument blocks (peak ${midiPeak.toFixed(3)})`);
+  await page.waitFor('gameboy.emulator.gb.apu.midi.voices.some((v) => v.active && v.isArranger)', 5000);
+  check(await page.eval('gameboy.emulator.gb.apu.midi.arranger.phraseScore >= 1.35'), 'HarmonicArranger orchestrates live accompaniment voices on the score');
   await page.press('KeyI', 'i');
   check(!(await page.eval('document.getElementById("midi-enabled").checked')) && !(await page.eval('gameboy.emulator.gb.apu.midiEnabled')), 'I key unchecks MIDI instruments');
   await page.clickOn('#palettes [data-palette="classic"]');

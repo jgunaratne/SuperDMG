@@ -164,7 +164,7 @@ export class AutoPlayer {
     this.enabled = false;
     this.thinking = false;
     this.effort = 'low';
-    this.model = 'gemini-2.5-flash';
+    this.model = 'gemini-3.8-flash';
     this.turnCount = 0;
     this.lastLatencyMs = 0;
     this.lastObservation = '';
@@ -334,7 +334,7 @@ export class AutoPlayer {
       this._consecutiveErrors = 0;
       this.thinking = false;
       this.turnCount++;
-      this.model = data.model || 'gemini-2.5-flash';
+      this.model = data.model || 'gemini-3.8-flash';
       this.lastLatencyMs = Number(data.elapsedMs) || 0;
       this.lastObservation = data.observation || '';
       this.lastGoal = data.goal || '';

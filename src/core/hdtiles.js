@@ -846,7 +846,7 @@ export class HdTilePack {
       ? (layer === 'win' ? this.hudColors : this.themeColors)
       : unpackColors4(fallbackPacked4);
 
-    if (st.unique === 1 || (!transparentZero && isGlyphTile(raw64, st))) {
+    if (st.unique === 1 || (layer === 'win' && st.unique === 2) || (!transparentZero && isGlyphTile(raw64, st))) {
       const rgba = renderCrispTile32(raw64, palReg, colors4, null, transparentZero);
       const res = { rgba, u32: rgbaToU32(rgba), tier: 'scene' };
       this.renderCache.set(cacheKey, res);
